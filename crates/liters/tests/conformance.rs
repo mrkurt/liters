@@ -352,3 +352,143 @@ fn wal_growth_and_recovery() {
     litestream_restore(&oracle, &bucket, &restored, &[]);
     assert_eq!(rows_of(&restored), rows_of(&db_path));
 }
+
+/// A snapshot taken right after an app relaunch must contain every committed
+/// transaction even when the persisted sync-state file is missing or stale:
+/// the WAL scan bound must come from the newest L0 header, never from the
+/// advisory sync-state value. (A stale bound silently drops un-checkpointed
+/// commits from a snapshot that claims to contain them, and retention then
+/// makes the loss permanent.)
+#[test]
+fn snapshot_after_reopen_survives_missing_or_stale_sync_state() {
+    let Some(oracle) = oracle_dir() else { return };
+
+    // Trigger A: sync-state file deleted between launches.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("app.db");
+        let bucket = tmp.path().join("bucket");
+        let app = Connection::open(&db_path).unwrap();
+        app.pragma_update(None, "journal_mode", "WAL").unwrap();
+        app.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+
+        {
+            let mut w = Writer::open(
+                &db_path,
+                Box::new(DirReplicaClient::new(&bucket)),
+                WriterOptions::default(),
+            )
+            .unwrap();
+            for i in 0..5 {
+                app.execute("INSERT INTO t (v) VALUES (?1)", [format!("a-{i}")]).unwrap();
+                w.push().unwrap();
+            }
+        }
+
+        let meta = tmp.path().join(".app.db-litestream");
+        std::fs::remove_file(meta.join("sync-state")).unwrap();
+
+        let mut w = Writer::open(
+            &db_path,
+            Box::new(DirReplicaClient::new(&bucket)),
+            WriterOptions::default(),
+        )
+        .unwrap();
+        assert!(w.snapshot().unwrap().is_some());
+
+        let restored = tmp.path().join("restored.db");
+        litestream_restore(&oracle, &bucket, &restored, &[]);
+        assert_eq!(rows_of(&restored), rows_of(&db_path), "sync-state deleted");
+    }
+
+    // Trigger B: sync-state one push behind (the crash window between the L0
+    // rename and the sync-state write).
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("app.db");
+        let bucket = tmp.path().join("bucket");
+        let app = Connection::open(&db_path).unwrap();
+        app.pragma_update(None, "journal_mode", "WAL").unwrap();
+        app.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+
+        let meta = tmp.path().join(".app.db-litestream");
+        let stale = {
+            let mut w = Writer::open(
+                &db_path,
+                Box::new(DirReplicaClient::new(&bucket)),
+                WriterOptions::default(),
+            )
+            .unwrap();
+            app.execute("INSERT INTO t (v) VALUES ('first')", []).unwrap();
+            w.push().unwrap();
+            let stale = std::fs::read(meta.join("sync-state")).unwrap();
+            app.execute("INSERT INTO t (v) VALUES ('second')", []).unwrap();
+            w.push().unwrap();
+            stale
+        };
+        std::fs::write(meta.join("sync-state"), &stale).unwrap();
+
+        let mut w = Writer::open(
+            &db_path,
+            Box::new(DirReplicaClient::new(&bucket)),
+            WriterOptions::default(),
+        )
+        .unwrap();
+        assert!(w.snapshot().unwrap().is_some());
+
+        let restored = tmp.path().join("restored.db");
+        litestream_restore(&oracle, &bucket, &restored, &[]);
+        assert_eq!(rows_of(&restored), rows_of(&db_path), "sync-state one push behind");
+    }
+}
+
+/// An out-of-band page-size change between writer lifetimes (journal_mode=
+/// DELETE + PRAGMA page_size + VACUUM) leaves the newest L0's resume offset
+/// smaller than one new-size frame. Go returns a controlled error
+/// (db.go:1594); liters must do the same, not underflow. No oracle needed.
+#[test]
+fn page_size_change_between_launches_errors_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("app.db");
+    let bucket = tmp.path().join("bucket");
+
+    let app = Connection::open(&db_path).unwrap();
+    app.pragma_update(None, "page_size", 512).unwrap();
+    app.pragma_update(None, "journal_mode", "WAL").unwrap();
+    app.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+
+    {
+        let mut w = Writer::open(
+            &db_path,
+            Box::new(DirReplicaClient::new(&bucket)),
+            WriterOptions::default(),
+        )
+        .unwrap();
+        app.execute("INSERT INTO t (v) VALUES ('small-pages')", []).unwrap();
+        w.push().unwrap();
+    }
+
+    // The only legal way to change page size; deletes the old WAL.
+    app.pragma_update(None, "journal_mode", "delete").unwrap();
+    app.pragma_update(None, "page_size", 4096).unwrap();
+    app.execute_batch("VACUUM").unwrap();
+    app.pragma_update(None, "journal_mode", "WAL").unwrap();
+
+    let mut w = Writer::open(
+        &db_path,
+        Box::new(DirReplicaClient::new(&bucket)),
+        WriterOptions::default(),
+    )
+    .unwrap();
+    app.execute("INSERT INTO t (v) VALUES ('big-pages')", []).unwrap();
+    match w.push() {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("prev WAL offset is less than the header size"),
+                "expected Go's controlled verify error, got: {msg}"
+            );
+        }
+        Ok(r) => panic!("push unexpectedly succeeded after page-size change: {r:?}"),
+    }
+}

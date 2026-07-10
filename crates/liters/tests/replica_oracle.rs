@@ -431,3 +431,193 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     }
     out
 }
+
+/// A wiped-but-not-yet-reseeded bucket is a transient window, not divergence:
+/// sync must no-op (Go's follow loop no-ops on empty listings) and must never
+/// destroy the healthy local replica — even with auto_reset. Divergence fires
+/// only once the reseeded history actually appears.
+#[test]
+fn wiped_bucket_sync_is_nondestructive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, db_path, bucket) = setup(tmp.path());
+
+    {
+        let mut w = Writer::open(
+            &db_path,
+            Box::new(DirReplicaClient::new(&bucket)),
+            WriterOptions::default(),
+        )
+        .unwrap();
+        for i in 0..3 {
+            app.execute("INSERT INTO t (v) VALUES (?1)", [format!("w-{i}")]).unwrap();
+            w.push().unwrap();
+        }
+    }
+
+    let replica_path = tmp.path().join("replica.db");
+    let mut rep = Replica::open(
+        &replica_path,
+        Box::new(DirReplicaClient::new(&bucket)),
+        ReplicaOptions { auto_reset: true, ..Default::default() },
+    );
+    assert_eq!(rep.sync().unwrap().to_txid, Txid(3));
+    let healthy_rows = rows_of(&replica_path);
+
+    // Wipe the bucket; do not reseed yet.
+    DirReplicaClient::new(&bucket).delete_all().unwrap();
+
+    // Mid-window sync: a no-op, with the local replica left fully readable.
+    let r = rep.sync().unwrap();
+    assert!(!r.restored);
+    assert_eq!(r.to_txid, Txid(3));
+    assert!(replica_path.exists(), "local replica must survive the wipe window");
+    assert_eq!(rows_of(&replica_path), healthy_rows);
+
+    // Same holds without auto_reset.
+    let mut plain = Replica::open(
+        &replica_path,
+        Box::new(DirReplicaClient::new(&bucket)),
+        ReplicaOptions::default(),
+    );
+    assert_eq!(plain.sync().unwrap().to_txid, Txid(3));
+    assert_eq!(rows_of(&replica_path), healthy_rows);
+
+    // Reseed with a fresh history; now divergence is real and auto_reset
+    // replaces the replica atomically.
+    let meta = tmp.path().join(".app.db-litestream");
+    std::fs::remove_dir_all(&meta).unwrap();
+    app.execute("INSERT INTO t (v) VALUES ('reseeded')", []).unwrap();
+    let mut w = Writer::open(
+        &db_path,
+        Box::new(DirReplicaClient::new(&bucket)),
+        WriterOptions::default(),
+    )
+    .unwrap();
+    w.push().unwrap();
+
+    let r = rep.sync().unwrap();
+    assert!(r.restored);
+    assert_eq!(r.to_txid, Txid(1));
+    assert_eq!(rows_of(&replica_path), rows_of(&db_path));
+}
+
+type StorageResult<T> = std::result::Result<T, liters::StorageError>;
+
+/// Wraps a real client, 404ing the first L0 open (a list-then-GC race) and
+/// counting snapshot-level opens.
+struct Fail404Once {
+    inner: DirReplicaClient,
+    fail_next_l0: std::sync::atomic::AtomicBool,
+    snapshot_opens: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ReplicaClient for Fail404Once {
+    fn client_type(&self) -> &'static str {
+        self.inner.client_type()
+    }
+    fn ltx_files(
+        &self,
+        level: u8,
+        seek: Txid,
+        use_metadata: bool,
+    ) -> StorageResult<Vec<ltx::FileInfo>> {
+        self.inner.ltx_files(level, seek, use_metadata)
+    }
+    fn open_ltx_file(
+        &self,
+        level: u8,
+        min_txid: Txid,
+        max_txid: Txid,
+        offset: u64,
+        size: u64,
+    ) -> StorageResult<Box<dyn std::io::Read + Send>> {
+        use std::sync::atomic::Ordering;
+        if level == 9 {
+            self.snapshot_opens.fetch_add(1, Ordering::SeqCst);
+        }
+        if level == 0 && self.fail_next_l0.swap(false, Ordering::SeqCst) {
+            return Err(liters::StorageError::NotFound { level, min_txid, max_txid });
+        }
+        self.inner.open_ltx_file(level, min_txid, max_txid, offset, size)
+    }
+    fn write_ltx_file(
+        &self,
+        level: u8,
+        min_txid: Txid,
+        max_txid: Txid,
+        rd: &mut dyn std::io::Read,
+    ) -> StorageResult<ltx::FileInfo> {
+        self.inner.write_ltx_file(level, min_txid, max_txid, rd)
+    }
+    fn delete_ltx_files(&self, infos: &[ltx::FileInfo]) -> StorageResult<()> {
+        self.inner.delete_ltx_files(infos)
+    }
+    fn delete_all(&self) -> StorageResult<()> {
+        self.inner.delete_all()
+    }
+}
+
+/// A 404 on a file the sync just listed is a compaction/GC race: the replica
+/// must retry next sync (Go's behavior) and must NOT fall back to
+/// downloading and applying a full snapshot in the same sync.
+#[test]
+fn transient_404_retries_without_snapshot_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, db_path, bucket) = setup(tmp.path());
+
+    let mut w = Writer::open(
+        &db_path,
+        Box::new(DirReplicaClient::new(&bucket)),
+        WriterOptions::default(),
+    )
+    .unwrap();
+    for i in 0..3 {
+        app.execute("INSERT INTO t (v) VALUES (?1)", [format!("t-{i}")]).unwrap();
+        w.push().unwrap();
+    }
+
+    let replica_path = tmp.path().join("replica.db");
+    let snapshot_opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut rep = Replica::open(
+        &replica_path,
+        Box::new(Fail404Once {
+            inner: DirReplicaClient::new(&bucket),
+            fail_next_l0: std::sync::atomic::AtomicBool::new(false),
+            snapshot_opens: snapshot_opens.clone(),
+        }),
+        ReplicaOptions::default(),
+    );
+    assert_eq!(rep.sync().unwrap().to_txid, Txid(3));
+
+    // New L0 (txid 4) plus an L9 snapshot covering 1..=4.
+    app.execute("INSERT INTO t (v) VALUES ('t-3')", []).unwrap();
+    w.push().unwrap();
+    assert_eq!(w.snapshot().unwrap(), Some(Txid(4)));
+    snapshot_opens.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    // Recreate the replica with the 404 armed for the next L0 open.
+    let mut rep = Replica::open(
+        &replica_path,
+        Box::new(Fail404Once {
+            inner: DirReplicaClient::new(&bucket),
+            fail_next_l0: std::sync::atomic::AtomicBool::new(true),
+            snapshot_opens: snapshot_opens.clone(),
+        }),
+        ReplicaOptions::default(),
+    );
+
+    // Raced sync: no progress, and crucially no snapshot download.
+    let r = rep.sync().unwrap();
+    assert!(!r.restored);
+    assert_eq!(r.to_txid, Txid(3), "raced sync must not advance");
+    assert_eq!(
+        snapshot_opens.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "transient 404 must not trigger a full snapshot apply"
+    );
+
+    // Next sync sees the truth and applies the small L0 delta.
+    let r = rep.sync().unwrap();
+    assert_eq!(r.to_txid, Txid(4));
+    assert_eq!(rows_of(&replica_path), rows_of(&db_path));
+}

@@ -38,8 +38,10 @@ pub struct ReplicaOptions {
     /// `sync()`.
     pub use_file_locks: bool,
     /// On divergence (bucket reseeded below our position) or unresumable
-    /// local state, delete the local replica and restore from scratch
-    /// instead of returning [`Error::Diverged`].
+    /// local state, restore from scratch instead of returning
+    /// [`Error::Diverged`]. The restore materializes to a temp file and
+    /// atomically replaces the local replica, so the existing replica
+    /// survives if the restore fails partway.
     pub auto_reset: bool,
 }
 
@@ -115,7 +117,6 @@ impl Replica {
         if from.is_zero() {
             // Local file without a sidecar: unresumable. (replica.go:566-568)
             if self.opts.auto_reset {
-                self.reset()?;
                 let to = self.full_restore()?;
                 return Ok(SyncResult { restored: true, from_txid: Txid(0), to_txid: to });
             }
@@ -127,8 +128,10 @@ impl Replica {
 
         match self.incremental_sync(from) {
             Ok(to) => Ok(SyncResult { restored: false, from_txid: from, to_txid: to }),
+            // The healthy replica is never deleted up front: full_restore
+            // replaces it atomically only once a complete new image exists,
+            // so a failed restore leaves the old replica readable.
             Err(Error::Diverged { .. }) if self.opts.auto_reset => {
-                self.reset()?;
                 let to = self.full_restore()?;
                 Ok(SyncResult { restored: true, from_txid: from, to_txid: to })
             }
@@ -207,6 +210,10 @@ impl Replica {
         let page_size = read_page_size(&mut f)?;
 
         let mut current = from;
+        // A 404 on a file we just listed is a race with compaction/GC, not a
+        // pruned chain: suppress the snapshot fallback for this sync and
+        // re-list next time, like Go's retry-next-tick. (replica.go:844-849)
+        let mut saw_404 = false;
 
         // Poll L0 for incremental files. (replica.go:801-851)
         let l0 = self.client.ltx_files(0, Txid(current.0 + 1), false)?;
@@ -214,13 +221,13 @@ impl Replica {
         let saw_level0 = !l0.is_empty();
         for info in l0 {
             if info.min_txid.0 > current.0 + 1 {
-                current = self.fill_follow_gap(&f, current, info.min_txid, page_size)?;
+                current = self.fill_follow_gap(&f, current, info.min_txid, page_size, &mut saw_404)?;
                 if info.max_txid <= current {
                     continue;
                 }
                 if info.min_txid.0 > current.0 + 1 {
                     // Still gapped; try again next sync (or snapshot below).
-                    return self.finish_incremental(&f, from, current, page_size);
+                    return self.finish_incremental(&f, from, current, page_size, !saw_404);
                 }
             }
             if info.max_txid <= current {
@@ -231,29 +238,32 @@ impl Replica {
                 // A listed file may 404 mid-race with compaction/GC:
                 // re-list next sync; never advance past it. (resumable_reader.go:75)
                 Err(Error::Storage(StorageError::NotFound { .. })) => {
-                    return self.finish_incremental(&f, from, current, page_size)
+                    return self.finish_incremental(&f, from, current, page_size, false)
                 }
                 Err(e) => return Err(e),
             }
         }
 
         if !saw_level0 {
-            current = self.fill_follow_gap(&f, current, Txid(current.0 + 1), page_size)?;
+            current = self.fill_follow_gap(&f, current, Txid(current.0 + 1), page_size, &mut saw_404)?;
         }
 
-        self.finish_incremental(&f, from, current, page_size)
+        self.finish_incremental(&f, from, current, page_size, !saw_404)
     }
 
     /// Post-pass: snapshot fallback and divergence detection, then persist
-    /// the new position.
+    /// the new position. `allow_snapshot_fallback` is false when this sync
+    /// hit a transient 404 — no-progress then means "retry next sync", not
+    /// "the chain was pruned".
     fn finish_incremental(
         &mut self,
         f: &File,
         from: Txid,
         mut current: Txid,
         page_size: u32,
+        allow_snapshot_fallback: bool,
     ) -> Result<Txid> {
-        if current == from {
+        if current == from && allow_snapshot_fallback {
             // No progress. Distinguish up-to-date / snapshot-only-newer /
             // diverged via the bucket-wide max TXID.
             let mut bucket_max = Txid(0);
@@ -271,12 +281,16 @@ impl Replica {
                 }
             }
 
-            if bucket_max < current && !bucket_max.is_zero() {
-                return Err(Error::Diverged { local: current, remote: bucket_max });
+            // A completely empty bucket is a no-op sync, not divergence: it
+            // is the transient window of a wipe-then-reseed, and there is
+            // nothing to restore from anyway. Go's follow loop likewise
+            // no-ops on empty listings. Divergence is only declared on
+            // positive evidence: files present whose max is below ours.
+            if bucket_max.is_zero() {
+                return Ok(current);
             }
-            if bucket_max.is_zero() && !current.is_zero() {
-                // Bucket wiped entirely.
-                return Err(Error::Diverged { local: current, remote: Txid(0) });
+            if bucket_max < current {
+                return Err(Error::Diverged { local: current, remote: bucket_max });
             }
 
             // Newer data reachable only via a snapshot (levels 0-8 pruned):
@@ -305,6 +319,7 @@ impl Replica {
         after: Txid,
         gap_min: Txid,
         page_size: u32,
+        saw_404: &mut bool,
     ) -> Result<Txid> {
         let mut current = after;
         for level in 1..SNAPSHOT_LEVEL {
@@ -317,7 +332,10 @@ impl Replica {
                 }
                 match self.apply_ltx_file(f, &info, page_size) {
                     Ok(()) => current = info.max_txid,
-                    Err(Error::Storage(StorageError::NotFound { .. })) => return Ok(current),
+                    Err(Error::Storage(StorageError::NotFound { .. })) => {
+                        *saw_404 = true;
+                        return Ok(current);
+                    }
                     Err(e) => return Err(e),
                 }
                 if current.0 + 1 >= gap_min.0 {

@@ -293,8 +293,13 @@ impl Writer {
         };
 
         // No new committed pages and no snapshot required: no-op push.
-        // (db.go:1913-1916)
+        // Even so, report the true consumed end from verify() (derived from
+        // the newest L0 header) rather than the advisory persisted value: a
+        // stale or missing sync-state file must never shrink the bound that
+        // snapshot() scans the WAL to, or committed frames silently fall out
+        // of the snapshot. (db.go:1913-1916)
         if !info.snapshotting && sz == 0 {
+            result.new_wal_size = info.offset;
             return Ok(result);
         }
 

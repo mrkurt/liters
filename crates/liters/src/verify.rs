@@ -139,20 +139,23 @@ pub fn verify(
         return Ok(info);
     }
 
-    // Edge: exactly one frame synced ever. (db.go:1582-1596)
-    let prev_wal_offset = info.offset - frame_size;
-    if prev_wal_offset == WAL_HEADER_SIZE {
+    // Edge: exactly one frame synced ever. Computed in i64 like Go: an L0
+    // resume offset smaller than one frame (e.g. after an out-of-band page
+    // size change) must hit the guard below, not wrap. (db.go:1582-1596)
+    let prev_wal_offset = info.offset as i64 - frame_size as i64;
+    if prev_wal_offset == WAL_HEADER_SIZE as i64 {
         if salt_match {
             info.snapshotting = false;
             return Ok(info);
         }
         info.reason = Some("wal header salt reset, snapshotting");
         return Ok(info);
-    } else if prev_wal_offset < WAL_HEADER_SIZE {
+    } else if prev_wal_offset < WAL_HEADER_SIZE as i64 {
         return Err(Error::Other(format!(
             "prev WAL offset is less than the header size: {prev_wal_offset}"
         )));
     }
+    let prev_wal_offset = prev_wal_offset as u64;
 
     // The frame we last synced must still exist, with matching salts and
     // byte-identical page content in the newest L0 file. (db.go:1598-1605)
