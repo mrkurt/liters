@@ -1,0 +1,49 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+env:
+  # Commit of benbjohnson/litestream the oracle suite is validated against
+  # (v0.5.14 + 1). reference/ is not checked in; CI fetches it here.
+  LITESTREAM_REF: c96c0f42a51bf48a40e13a1569a46312e957b429
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.26.4'
+          cache-dependency-path: tests/oracle-helper/go.sum
+
+      - name: Fetch litestream reference checkout
+        run: |
+          git init -q reference/litestream
+          git -C reference/litestream fetch -q --depth 1 https://github.com/benbjohnson/litestream "$LITESTREAM_REF"
+          git -C reference/litestream checkout -q FETCH_HEAD
+
+      - name: Install MinIO (S3 oracle tests skip without it)
+        run: |
+          curl -sSfL https://dl.min.io/server/minio/release/linux-amd64/minio -o /tmp/minio
+          chmod +x /tmp/minio
+          sudo mv /tmp/minio /usr/local/bin/minio
+
+      - name: Build Go oracle binaries
+        run: make oracle
+
+      - name: Run tests
+        run: make test
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
