@@ -1,0 +1,21 @@
+[package]
+name = "liters-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Replica storage backends for liters (litestream-compatible layouts)"
+
+[dependencies]
+ltx = { workspace = true }
+thiserror = { workspace = true }
+object_store = { version = "0.12", features = ["aws"], optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
+futures = { version = "0.3", optional = true }
+chrono = { version = "0.4", optional = true }
+
+[features]
+s3 = ["dep:object_store", "dep:tokio", "dep:futures", "dep:chrono"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rusqlite = { workspace = true }

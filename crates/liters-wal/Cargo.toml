@@ -1,0 +1,13 @@
+[package]
+name = "liters-wal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite WAL and database-header reading for liters"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rusqlite = { workspace = true }
+tempfile = { workspace = true }

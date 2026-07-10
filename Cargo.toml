@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ltx",
+    "crates/liters-wal",
+    "crates/liters-storage",
+    "crates/liters",
+    "crates/liters-ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+ltx = { path = "crates/ltx" }
+liters-wal = { path = "crates/liters-wal" }
+liters-storage = { path = "crates/liters-storage" }
+
+crc = "3"
+lz4_flex = { version = "0.13", default-features = false, features = ["std"] }
+twox-hash = { version = "2", default-features = false, features = ["std", "xxhash32"] }
+thiserror = "2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+tempfile = "3"
+proptest = "1"
+rand = "0.9"
+
+[profile.release]
+lto = true
+strip = true

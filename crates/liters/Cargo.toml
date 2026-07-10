@@ -1,0 +1,20 @@
+[package]
+name = "liters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Litestream-compatible SQLite replication for embedded use"
+
+[dependencies]
+ltx = { workspace = true }
+liters-wal = { workspace = true }
+liters-storage = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+liters-storage = { workspace = true, features = ["s3"] }

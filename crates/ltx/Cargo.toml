@@ -1,0 +1,18 @@
+[package]
+name = "ltx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LTX (Liteserver Transaction) file format codec, wire-compatible with superfly/ltx v0.5.1 as used by Litestream v0.5.x"
+
+[dependencies]
+crc = { workspace = true }
+lz4_flex = { workspace = true }
+twox-hash = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+rand = { workspace = true }
+rusqlite = { workspace = true }

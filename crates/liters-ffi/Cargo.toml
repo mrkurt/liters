@@ -1,0 +1,21 @@
+[package]
+name = "liters-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UniFFI bindings for liters (Swift/Kotlin)"
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "liters_ffi"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+liters = { path = "../liters" }
+liters-storage = { path = "../liters-storage", features = ["s3"] }
+ltx = { workspace = true }
+uniffi = { version = "0.32", features = ["cli"] }
+thiserror = { workspace = true }

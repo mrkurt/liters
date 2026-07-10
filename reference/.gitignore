@@ -1,0 +1,4 @@
+# Ignore everything in this directory except this file,
+# so the reference/ dir is kept but its contents stay untracked.
+*
+!.gitignore
