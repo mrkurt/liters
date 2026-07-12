@@ -15,7 +15,7 @@ path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
 liters = { path = "../liters" }
-liters-storage = { path = "../liters-storage", features = ["s3"] }
+liters-storage = { path = "../liters-storage", features = ["s3", "http"] }
 ltx = { workspace = true }
 uniffi = { version = "0.32", features = ["cli"] }
 thiserror = { workspace = true }

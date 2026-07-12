@@ -24,6 +24,14 @@ pub enum Storage {
         force_path_style: bool,
         allow_http: bool,
     },
+    /// Another liters instance serving its bucket over HTTP
+    /// (`http://host:port[/path]`). Always valid as a Replica source (sync
+    /// in a loop to follow; the Rust streaming `follow()` is not exposed
+    /// over FFI yet). Valid as a Writer destination when the server runs
+    /// with `writable: true` — that is push replication: this device dials
+    /// out and pushes, the listening liters receives. Read-only servers
+    /// reject the first push with a clear error.
+    Http { url: String },
 }
 
 impl Storage {
@@ -51,6 +59,11 @@ impl Storage {
                     allow_http,
                 })
                 .map_err(to_ffi_error)?;
+                Ok(Box::new(client))
+            }
+            Storage::Http { url } => {
+                let client =
+                    liters_storage::HttpReplicaClient::new(url).map_err(to_ffi_error)?;
                 Ok(Box::new(client))
             }
         }

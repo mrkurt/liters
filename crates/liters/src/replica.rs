@@ -12,9 +12,11 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use liters_storage::{ReplicaClient, SNAPSHOT_LEVEL};
-use ltx::{Compactor, Decoder, FileInfo, Txid, HEADER_FLAG_NO_CHECKSUM, HEADER_SIZE};
+use liters_storage::{ReplicaClient, StreamEvent, SNAPSHOT_LEVEL};
+use ltx::{is_contiguous, Compactor, Decoder, FileInfo, Txid, HEADER_FLAG_NO_CHECKSUM, HEADER_SIZE};
 use rand::RngCore;
 
 use crate::{Error, Result, StorageError};
@@ -52,6 +54,26 @@ impl Default for ReplicaOptions {
             use_file_locks: true,
             auto_reset: false,
         }
+    }
+}
+
+/// Options for [`Replica::follow`].
+#[derive(Debug, Clone)]
+pub struct FollowOptions {
+    /// Cadence for backends without streaming support, for waiting out an
+    /// empty (not-yet-seeded) bucket, and the backoff after a round that
+    /// made no progress (prevents hot resync loops against a pruned or
+    /// stalled bucket).
+    pub poll_interval: Duration,
+    /// `Some(d)`: transient storage/network errors back off `d` and retry
+    /// instead of returning — for followers that must survive server
+    /// restarts and flaky links. `None`: fail fast on the first error.
+    pub retry: Option<Duration>,
+}
+
+impl Default for FollowOptions {
+    fn default() -> Self {
+        FollowOptions { poll_interval: Duration::from_secs(1), retry: None }
     }
 }
 
@@ -137,6 +159,168 @@ impl Replica {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Follows the bucket continuously until `stop` is set or a fatal error
+    /// occurs. Uses the backend's live stream
+    /// ([`ReplicaClient::open_ltx_stream`], e.g. a liters HTTP server's
+    /// `/stream`) when available — new transactions apply as they arrive
+    /// over a single connection — and falls back to polling [`Replica::sync`]
+    /// otherwise.
+    ///
+    /// Every stream anomaly (gap, reseed, non-contiguous frame, corrupt
+    /// file) routes back through `sync()`, which owns the hardened
+    /// restore/bridge/divergence logic; `follow` never invents its own
+    /// recovery. The position sidecar advances after every applied
+    /// transaction, so a killed follower resumes exactly where it stopped.
+    ///
+    /// Blocking: run it on a dedicated thread and flip `stop` to end it.
+    /// Normally observed within ~a second (or after the in-flight file
+    /// finishes applying); the worst case is the stream dead-man bound
+    /// (~45s) if a frame stalls mid-transfer on a dead link.
+    pub fn follow(&mut self, stop: &AtomicBool, opts: &FollowOptions) -> Result<()> {
+        while !stop.load(Ordering::Relaxed) {
+            let before = self.position()?;
+            match self.sync() {
+                Ok(_) => {}
+                // Empty bucket: the writer has not seeded it yet. Wait,
+                // matching finish_incremental's empty-is-not-divergence
+                // stance.
+                Err(Error::TxNotAvailable) => {
+                    if sleep_checking(stop, opts.poll_interval) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(e) if is_transient(&e) && opts.retry.is_some() => {
+                    if sleep_checking(stop, opts.retry.unwrap()) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+            let mut position = self.position()?;
+            let mut made_progress = position > before;
+
+            let stream = match self.client.open_ltx_stream(Txid(position.0 + 1)) {
+                Ok(stream) => stream,
+                Err(e) if opts.retry.is_some() => {
+                    let _ = e;
+                    if sleep_checking(stop, opts.retry.unwrap()) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            let Some(mut stream) = stream else {
+                // No streaming support: plain sync() polling.
+                if sleep_checking(stop, opts.poll_interval) {
+                    return Ok(());
+                }
+                continue;
+            };
+
+            // (Re)open the database and page size after every sync():
+            // a full restore replaces the inode, and a reseeded bucket may
+            // change the page size.
+            let (db, page_size) = match open_db_for_apply(&self.db_path) {
+                Ok(pair) => pair,
+                Err(e) if is_transient(&e) && opts.retry.is_some() => {
+                    if sleep_checking(stop, opts.retry.unwrap()) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let spool_path = tmp_sibling(&self.db_path, ".apply.tmp");
+
+            // Runs until the stream ends or misbehaves. `None` = fall back
+            // to sync() (the stream told us to, or a frame didn't fit);
+            // `Some(e)` = this session failed — the error goes through the
+            // same transient/retry classification as sync() errors, so
+            // local I/O hiccups honor `retry` too.
+            let stream_err: Option<Error> = loop {
+                if stop.load(Ordering::Relaxed) {
+                    let _ = fs::remove_file(&spool_path);
+                    return Ok(());
+                }
+                let mut spool = match File::create(&spool_path) {
+                    Ok(f) => f,
+                    Err(e) => break Some(e.into()),
+                };
+                match stream.next(&mut spool) {
+                    Ok(StreamEvent::Ltx(info)) => {
+                        if info.max_txid <= position {
+                            continue; // stale frame, already applied
+                        }
+                        if !is_contiguous(position, info.min_txid, info.max_txid) {
+                            break None; // gapped frame: bridge via sync()
+                        }
+                        if let Err(e) = spool.sync_all() {
+                            break Some(e.into());
+                        }
+                        drop(spool);
+                        match self.apply_spooled(&db, &spool_path, page_size) {
+                            Ok(()) => {
+                                position = info.max_txid;
+                                if let Err(e) = write_txid_file(&self.db_path, position) {
+                                    break Some(e);
+                                }
+                                made_progress = true;
+                            }
+                            // Divergence, CRC/decode failures, and storage
+                            // errors re-run through sync(), which owns the
+                            // hardened routing (auto_reset, re-fetch by
+                            // listing, ...).
+                            Err(Error::Diverged { .. } | Error::Ltx(_) | Error::Storage(_)) => {
+                                break None
+                            }
+                            Err(e) => break Some(e),
+                        }
+                    }
+                    // An idle ping carrying a non-empty bucket max below our
+                    // position is positive divergence evidence: let sync()
+                    // confirm and route it. (Empty buckets are a
+                    // wipe-then-reseed window, not divergence.)
+                    Ok(StreamEvent::Idle { bucket_max: Some(m) })
+                        if !m.is_zero() && m < position =>
+                    {
+                        break None
+                    }
+                    Ok(StreamEvent::Idle { .. }) => continue,
+                    Ok(StreamEvent::Gap { .. } | StreamEvent::Reset { .. } | StreamEvent::Closed) => {
+                        break None
+                    }
+                    // Unknown future event (StreamEvent is non-exhaustive):
+                    // safest response is drop-the-stream and resync.
+                    Ok(_) => break None,
+                    Err(e) => break Some(e.into()),
+                }
+            };
+            let _ = fs::remove_file(&spool_path);
+
+            if let Some(e) = stream_err {
+                match opts.retry {
+                    Some(backoff) => {
+                        if sleep_checking(stop, backoff) {
+                            return Ok(());
+                        }
+                    }
+                    None => return Err(e),
+                }
+            } else if !made_progress {
+                // The whole round moved nothing: back off before resyncing
+                // so a pruned/stalled bucket can't induce a hot spin.
+                if sleep_checking(stop, opts.poll_interval) {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Full restore: plan → k-way merge → materialize → rename → verify.
@@ -350,13 +534,9 @@ impl Replica {
         Ok(current)
     }
 
-    /// Applies one LTX file's pages to the replica in place. The file is
-    /// downloaded and CRC-verified in full *before* any page is written
-    /// (hardening over Go, which verifies after). Page 1 gets the journal
-    /// mode + change counter fixups; the file is truncated to the commit
-    /// size. (replica.go:879-930)
+    /// Applies one LTX file's pages to the replica in place: fetches to the
+    /// spool file, then [`Replica::apply_spooled`]. (replica.go:879-930)
     fn apply_ltx_file(&mut self, f: &File, info: &FileInfo, page_size: u32) -> Result<()> {
-        // Fetch to a temp file and verify end-to-end.
         let spool_path = tmp_sibling(&self.db_path, ".apply.tmp");
         let _cleanup = TmpGuard(&spool_path);
         {
@@ -365,18 +545,27 @@ impl Replica {
             std::io::copy(&mut rc, &mut spool)?;
             spool.sync_all()?;
         }
+        self.apply_spooled(f, &spool_path, page_size)
+    }
+
+    /// Applies one complete, already-spooled LTX file. The spool is
+    /// CRC-verified in full *before* any page is written (hardening over Go,
+    /// which verifies after). Page 1 gets the journal mode + change counter
+    /// fixups; the file is truncated to the commit size. Shared by the
+    /// fetch-by-listing path and streaming follow.
+    fn apply_spooled(&mut self, f: &File, spool_path: &Path, page_size: u32) -> Result<()> {
         {
-            let dec = Decoder::new(BufReader::new(File::open(&spool_path)?));
+            let dec = Decoder::new(BufReader::new(File::open(spool_path)?));
             dec.verify()?;
         }
 
-        let mut dec = Decoder::new(BufReader::new(File::open(&spool_path)?));
+        let mut dec = Decoder::new(BufReader::new(File::open(spool_path)?));
         dec.decode_header()?;
         let hdr = *dec.header();
         if hdr.page_size != page_size {
             // Page-size change implies a bucket reset. (compat: ltx
             // compactor rejects mismatched page sizes)
-            return Err(Error::Diverged { local: info.min_txid, remote: info.max_txid });
+            return Err(Error::Diverged { local: hdr.min_txid, remote: hdr.max_txid });
         }
 
         let _lock = if self.opts.use_file_locks { Some(FcntlLock::exclusive(f)?) } else { None };
@@ -466,6 +655,39 @@ impl Drop for FcntlLock<'_> {
         let _ =
             set_fcntl_lock(self.f, libc::F_UNLCK as libc::c_short, SQLITE_SHARED_FIRST, SQLITE_SHARED_SIZE);
         let _ = set_fcntl_lock(self.f, libc::F_UNLCK as libc::c_short, SQLITE_PENDING_BYTE, 1);
+    }
+}
+
+/// Errors worth retrying under [`FollowOptions::retry`]: storage/transport
+/// failures and local I/O hiccups. Divergence and integrity errors are
+/// never retried blindly. Note that storage-layer errors include
+/// misconfiguration (wrong URL, protocol mismatch) — a follower configured
+/// with `retry` will keep retrying those; validate connectivity up front if
+/// that matters.
+fn is_transient(e: &Error) -> bool {
+    matches!(e, Error::Storage(_) | Error::Io(_))
+}
+
+/// Fresh handle + page size for in-place page application.
+fn open_db_for_apply(db_path: &Path) -> Result<(File, u32)> {
+    let mut db = OpenOptions::new().read(true).write(true).open(db_path)?;
+    let page_size = read_page_size(&mut db)?;
+    Ok((db, page_size))
+}
+
+/// Sleeps `total` in short slices so `stop` stays responsive; returns true
+/// if stopped.
+fn sleep_checking(stop: &AtomicBool, total: Duration) -> bool {
+    let deadline = Instant::now() + total;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
     }
 }
 

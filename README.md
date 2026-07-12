@@ -37,9 +37,63 @@ r.sync()?;                                  // restore on first call, then incre
 |---|---|
 | `ltx` | LTX v0.5.1 codec: encoder, decoder, page index, k-way compactor, CRC-64/GO-ISO checksums |
 | `liters-wal` | SQLite WAL reader: salt/checksum-verified frames, committed-transaction page maps |
-| `liters-storage` | `ReplicaClient` trait; `dir` backend (litestream `file` layout) and `s3` backend (litestream S3 layout, feature `s3`) |
+| `liters-storage` | `ReplicaClient` trait; `dir` backend (litestream `file` layout), `s3` backend (litestream S3 layout, feature `s3`), and liters-native HTTP serving + source (feature `http`) |
 | `liters` | `Writer` (push pipeline, checkpointing, device-side compaction/retention) and `Replica` (restore + incremental follow) |
 | `liters-ffi` | UniFFI bindings for Swift/Kotlin (`scripts/build-ios.sh`, `scripts/build-android.sh`) |
+
+## HTTP replication (liters-native)
+
+With the `http` feature, a liters process can serve its bucket over HTTP and
+other liters instances can restore from it and **follow it live** — new
+transactions stream to followers over a single long-lived connection, with
+no object store in between. Stock litestream has no HTTP scheme; the wire
+protocol is liters-proprietary and specified in
+[docs/http-protocol.md](docs/http-protocol.md).
+
+```rust
+use std::sync::Arc;
+use liters_storage::{DirReplicaClient, HttpReplicaClient, HttpServer, HttpServerOptions};
+
+// Serving side: writer pushes to a local dir bucket; the server serves it.
+// The notifying tee wakes followers the instant a push lands.
+let srv = HttpServer::bind("0.0.0.0:9736", Arc::new(DirReplicaClient::new("/bucket")),
+                           HttpServerOptions::default())?;
+let mut w = Writer::open("app.db", srv.notifying_client(Box::new(DirReplicaClient::new("/bucket"))),
+                         WriterOptions::default())?;
+
+// Following side: restore over HTTP, then apply changes as they arrive.
+let mut r = Replica::open("replica.db", Box::new(HttpReplicaClient::new("http://host:9736")?),
+                          ReplicaOptions::default());
+r.follow(&stop_flag, &FollowOptions::default())?;   // blocks; flip stop_flag to end
+```
+
+`Replica::sync()` polling works over HTTP too (the server is a full
+read-side `ReplicaClient`), and the server can serve a bucket some other
+process writes — including stock `litestream replicate` — with poll-bounded
+latency. No TLS/auth in v1: bind private interfaces or front with a reverse
+proxy.
+
+Roles also reverse (**push replication**): a server started with
+`writable: true` *accepts* replication, and a writer whose destination is an
+`HttpReplicaClient` dials out and pushes — the shape you want when the
+writer is behind NAT or on a mobile network:
+
+```rust
+// Receiver: listens, materializes pushed data into a local bucket.
+let srv = HttpServer::bind("0.0.0.0:9736", Arc::new(DirReplicaClient::new("/bucket")),
+                           HttpServerOptions { writable: true, ..Default::default() })?;
+
+// Pusher (elsewhere): a normal Writer, destination is the receiver.
+let mut w = Writer::open("app.db", Box::new(HttpReplicaClient::new("http://receiver:9736")?),
+                         WriterOptions::default())?;
+w.push()?;      // L0 upload over HTTP; maintain() compacts/retains remotely too
+```
+
+Accepted pushes wake the receiver's `/stream` followers, so a writable
+server is also a relay: devices push in, downstream replicas stream out,
+and the receiver can follow its own server over loopback for a live local
+copy. The pushed bucket stays litestream-exact — stock `litestream restore`
+works against it.
 
 ## Compatibility
 

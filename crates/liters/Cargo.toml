@@ -17,4 +17,4 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
-liters-storage = { workspace = true, features = ["s3"] }
+liters-storage = { workspace = true, features = ["s3", "http"] }

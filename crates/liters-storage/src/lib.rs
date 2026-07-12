@@ -14,14 +14,18 @@
 //! against it); the S3 backend implements the second.
 
 mod dir;
+#[cfg(feature = "http")]
+mod http;
 #[cfg(feature = "s3")]
 mod s3;
 
 pub use dir::DirReplicaClient;
+#[cfg(feature = "http")]
+pub use http::{HttpReplicaClient, HttpServer, HttpServerOptions};
 #[cfg(feature = "s3")]
 pub use s3::{S3Config, S3ReplicaClient};
 
-use std::io::Read;
+use std::io::{Read, Write};
 
 use ltx::{FileInfo, Txid};
 
@@ -91,6 +95,53 @@ pub trait ReplicaClient: Send + Sync {
 
     /// Deletes everything under this client's path.
     fn delete_all(&self) -> Result<()>;
+
+    /// Opens a live stream of level-0 LTX files starting at `seek` (the
+    /// first TXID wanted, i.e. the follower's position + 1). Backends
+    /// without streaming support return `Ok(None)` and callers fall back to
+    /// polling [`ReplicaClient::ltx_files`].
+    fn open_ltx_stream(&self, seek: Txid) -> Result<Option<Box<dyn LtxStream>>> {
+        let _ = seek;
+        Ok(None)
+    }
+}
+
+/// A live change stream of complete level-0 LTX files, as produced by
+/// [`ReplicaClient::open_ltx_stream`]. Streams deliver whole files (the
+/// reader CRC-verifies each file before applying any page), never partial
+/// ones.
+pub trait LtxStream: Send {
+    /// Blocks (bounded — implementations tick at roughly one-second
+    /// granularity) until the next stream event. For [`StreamEvent::Ltx`]
+    /// the complete file body has been copied into `sink` before this
+    /// returns; `Idle` is only ever returned *between* frames, so a caller
+    /// may discard and reuse `sink` across calls. Once `next` returns an
+    /// error the stream is dead: drop it and reconnect.
+    fn next(&mut self, sink: &mut dyn Write) -> Result<StreamEvent>;
+}
+
+/// One event from an [`LtxStream`]. Non-exhaustive: protocol evolution may
+/// add events, and consumers must treat unknown events as "drop the stream
+/// and resync via listings".
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StreamEvent {
+    /// A complete level-0 LTX file was written to the sink.
+    Ltx(FileInfo),
+    /// Keepalive tick — nothing new. Server pings carry the bucket-wide max
+    /// TXID so followers can detect divergence (bucket max below their
+    /// position) while idle; timeout ticks carry `None`.
+    Idle { bucket_max: Option<Txid> },
+    /// The requested position is no longer available at level 0 (pruned by
+    /// retention); `next` is the oldest available min TXID. The stream ends
+    /// after this event — re-plan via listings.
+    Gap { next: Txid },
+    /// The bucket's max TXID is below the requested position: the bucket
+    /// was wiped or reseeded. The stream ends after this event — re-sync to
+    /// run divergence handling.
+    Reset { bucket_max: Txid },
+    /// The server ended the stream cleanly (e.g. shutdown).
+    Closed,
 }
 
 /// Returns the max-TXID file info at a level, or None if the level is empty.

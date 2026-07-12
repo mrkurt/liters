@@ -33,6 +33,13 @@ pub enum Error {
     #[error("replica diverged: local txid {local} ahead of bucket max {remote}")]
     Diverged { local: Txid, remote: Txid },
 
+    /// The requested transaction cannot be reconstructed from the bucket —
+    /// typically an empty (not-yet-seeded) bucket. Mirrors litestream's
+    /// `ErrTxNotAvailable` (store.go:27); the display string is litestream's
+    /// error text.
+    #[error("transaction not available")]
+    TxNotAvailable,
+
     #[error("{0}")]
     Other(String),
 }

@@ -15,7 +15,7 @@ use crate::{Error, Result};
 
 /// `ErrTxNotAvailable` equivalent. (store.go:27)
 pub fn tx_not_available() -> Error {
-    Error::Other("transaction not available".into())
+    Error::TxNotAvailable
 }
 
 /// Whether `next` is a better chain-extension candidate than `curr`:

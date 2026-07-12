@@ -21,6 +21,10 @@ pub struct DirReplicaClient {
     root: PathBuf,
 }
 
+/// Distinguishes concurrent same-process writers' tmp files (see
+/// `write_ltx_file`).
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl DirReplicaClient {
     pub fn new(root: impl Into<PathBuf>) -> DirReplicaClient {
         DirReplicaClient { root: root.into() }
@@ -128,7 +132,16 @@ impl ReplicaClient for DirReplicaClient {
         fs::create_dir_all(path.parent().unwrap())?;
 
         // tmp + fsync + rename for atomicity. (file/replica_client.go:183-231)
-        let tmp_path = path.with_extension("ltx.tmp");
+        // The tmp name is unique per write, not the fixed `<name>.ltx.tmp`:
+        // a writable HTTP server makes concurrent same-key writes real (a
+        // pusher's retry racing a stalled first attempt), and a shared tmp
+        // path would let the loser's cleanup unlink the winner's in-flight
+        // file. Listings skip any non-`.ltx` name, so strays are invisible.
+        let tmp_path = path.with_extension(format!(
+            "ltx.{}-{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let result = (|| -> Result<u64> {
             let mut f = File::create(&tmp_path)?;
             f.write_all(&hdr_buf)?;

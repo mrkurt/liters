@@ -12,9 +12,11 @@ object_store = { version = "0.12", features = ["aws"], optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
 futures = { version = "0.3", optional = true }
 chrono = { version = "0.4", optional = true }
+libc = { version = "0.2", optional = true }
 
 [features]
 s3 = ["dep:object_store", "dep:tokio", "dep:futures", "dep:chrono"]
+http = ["dep:libc"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
