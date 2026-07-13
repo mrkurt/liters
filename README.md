@@ -37,7 +37,7 @@ r.sync()?;                                  // restore on first call, then incre
 |---|---|
 | `ltx` | LTX v0.5.1 codec: encoder, decoder, page index, k-way compactor, CRC-64/GO-ISO checksums |
 | `liters-wal` | SQLite WAL reader: salt/checksum-verified frames, committed-transaction page maps |
-| `liters-storage` | `ReplicaClient` trait; `dir` backend (litestream `file` layout), `s3` backend (litestream S3 layout, feature `s3`), and liters-native HTTP serving + source with auth, multi-DB routing, and write fencing (feature `http`) |
+| `liters-storage` | `ReplicaClient` trait; `dir` backend (litestream `file` layout), `s3` backend (litestream S3 layout, feature `s3`), and liters-native HTTP serving + source with auth, a mountable `Mount` handler, and write fencing (feature `http`) |
 | `liters` | `Writer` (push pipeline, checkpointing, device-side compaction/retention), `Replica` (restore + incremental follow), and `Manager` (background replication for N databases with sleep/resume) |
 | `liters-ffi` | UniFFI bindings for Swift/Kotlin: `LitersWriter`, `LitersReplica`, `LitersManager` + event listener (`scripts/build-ios.sh`, `scripts/build-android.sh`) |
 
@@ -95,44 +95,41 @@ and the receiver can follow its own server over loopback for a live local
 copy. The pushed bucket stays litestream-exact — stock `litestream restore`
 works against it.
 
-### Multi-database serving, auth, fencing
+### Mounting, embedding, auth, fencing
 
-One server can carry many buckets, each addressed as `/db/{name}`; clients
-need no new API — the database is just part of the URL:
-
-```rust
-let srv = HttpServer::bind_multi("0.0.0.0:9736", HttpServerOptions {
-    writable: true,
-    auth_token: Some("secret".into()),
-    ..Default::default()
-})?;
-srv.add_db("app", Arc::new(DirReplicaClient::new("/buckets/app")))?;
-srv.add_db("catalog", Arc::new(DirReplicaClient::new("/buckets/catalog")))?;
-
-// A client for one database of the server:
-let client = HttpReplicaClient::with_options("http://host:9736/db/app",
-    HttpClientOptions { auth_token: Some("secret".into()), ..Default::default() })?;
-```
-
-`add_db`/`remove_db` work while serving, each bucket wakes its own
-`/stream` followers (`notifying_client_for`), and `bind` keeps serving its
-root bucket alongside added ones. With `auth_token` set, every route except
-the `GET /` health check requires `authorization: Bearer <token>`.
-
-Set `HttpServerOptions::base_path` to mount every endpoint under a URL path
-prefix so liters can share an origin with unrelated apps behind a
-path-routing reverse proxy — `http://host/db/...` reaches liters while
-`http://host/users/...` reaches something else. Requests outside the prefix
-are `404`; clients just point at the deeper URL (`http://host:9736/db`), and
-the base path they already parse from the URL lines up with the server's
-mount. (Alternatively, strip the prefix at the proxy and leave `base_path`
-unset — do one or the other, not both.)
+A server serves one database. Mount it under a URL path prefix
+(`HttpServerOptions::base_path`) so liters can share an origin with unrelated
+apps behind a path-routing reverse proxy — `http://host/db/...` reaches
+liters while `http://host/users/...` reaches something else. Requests outside
+the prefix are `404`; clients just point at the deeper URL, and the base path
+they already parse from the URL lines up with the server's mount.
+(Alternatively, strip the prefix at the proxy and leave `base_path` unset —
+do one or the other, not both.) With `auth_token` set, every route except the
+`GET /` health check requires `authorization: Bearer <token>`.
 
 ```rust
 let srv = HttpServer::bind("0.0.0.0:9736", Arc::new(DirReplicaClient::new("/bucket")),
-                           HttpServerOptions { base_path: Some("/db".into()), ..Default::default() })?;
+                           HttpServerOptions { base_path: Some("/db".into()),
+                                               auth_token: Some("secret".into()),
+                                               ..Default::default() })?;
 let client = HttpReplicaClient::new("http://host:9736/db")?;
 ```
+
+To serve liters from **your own** Rust HTTP server — one listener shared with
+other routes, or several databases dispatched by path — skip `HttpServer` and
+embed `Mount`, the transport-agnostic handler that is the protocol for one
+database. `HttpServer` is itself just a thin `TcpListener` driver over one:
+
+```rust
+let mount = Mount::new(Arc::new(DirReplicaClient::new("/bucket")), MountOptions::default());
+// in your router, for a request matched to this mount (prefix already stripped):
+let resp = mount.handle(Request { method, path, query, headers,
+                                  body: &mut req_body, cancel });
+// write resp.status + resp.headers, then the Body (Bytes / Reader / Stream).
+```
+
+`Mount::handle` is a pure request-in / response-out function: it owns all
+wire-format knowledge; your host owns the socket, the listener, and routing.
 
 Writable servers also *fence* pushers: a writer that sends an
 `x-liters-writer-id` header (`HttpClientOptions::writer_id`; the `Manager`
@@ -159,7 +156,7 @@ use liters::{Manager, ManagerOptions, PushConfig, FollowConfig, StorageConfig};
 let mgr = Manager::new(ManagerOptions::default());
 mgr.register_push("app", "app.db", PushConfig {
     storage: StorageConfig::Http {
-        url: "http://sync.example:9736/db/app".into(),
+        url: "http://sync.example:9736/db".into(),
         options: liters::HttpClientOptions {
             auth_token: Some("secret".into()),
             ..Default::default()

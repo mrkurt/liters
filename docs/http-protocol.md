@@ -41,12 +41,11 @@ level-0 LTX files to a follower over a single connection.
   The write endpoints (Push) are part of v1. The `level` field of `ltx`
   frames is the only in-version extension point (always `0` in v1).
 - Purely *additive* surface does not bump the version: optional request
-  headers (`authorization`, the fencing headers), new path prefixes
-  (`/db/{name}`), and an operator-configured mount prefix (see Mount path)
-  are ignored-or-404 on servers that predate them, and clients that never
-  send them observe byte-identical behavior. Authentication, multi-DB
-  routing, the mount prefix, and fencing are all such additions — a v1
-  server with none of them configured behaves exactly as before they
+  headers (`authorization`, the fencing headers) and an operator-configured
+  mount prefix (see Mount path) are ignored-or-404 on servers that predate
+  them, and clients that never send them observe byte-identical behavior.
+  Authentication, the mount prefix, and fencing are all such additions — a
+  v1 server with none of them configured behaves exactly as before they
   existed.
 - Servers ignore unknown query parameters, so older servers tolerate newer
   clients.
@@ -61,13 +60,11 @@ authorization: Bearer <token>
 ```
 
 on **every** route except the `GET /` health check (liveness probes carry
-no secrets; note that `GET /db/{name}` probes ARE gated — whether a name
-exists is information). The scheme is matched case-insensitively; the token
-must match exactly. Anything missing or wrong is `401` with body
-`authorization required`; rejected `PUT` bodies get the same bounded drain
-treatment as `403` so the response survives the unread body. Auth is
-checked before DB resolution, so an unauthorized request cannot distinguish
-existing from unknown names.
+no secrets; the mount-root probe `GET /{prefix}` IS gated). The scheme is
+matched case-insensitively; the token must match exactly. Anything missing
+or wrong is `401` with body `authorization required`; rejected `PUT` bodies
+get the same bounded drain treatment as `403` so the response survives the
+unread body.
 
 Tokens (and writer ids, see Fencing) must be visible ASCII
 (`0x21..=0x7e`); the reference client rejects anything else at
@@ -86,12 +83,11 @@ reaches liters while `http://host/users/...` reaches something else. Every
 endpoint moves under the prefix:
 
 ```
-/db/ltx/{level}...   /db/stream?seek=...   /db/db/{name}/...   /db/all   etc.
+/db/ltx/{level}...   /db/stream?seek=...   /db/all   etc.
 ```
 
-- The prefix is stripped before routing, so the root-bucket and
-  `/db/{name}` multi-DB layouts are unchanged beneath it (multi-DB thus
-  lands at `/{prefix}/db/{name}/...`).
+- The prefix is stripped before routing, so the endpoint grammar below is
+  unchanged beneath it.
 - A request whose path is **not** under the prefix is `404 not found`
   (checked after auth, so the prefix layout is not probeable without the
   token). PUT bodies on such requests get the same bounded drain as any
@@ -100,9 +96,8 @@ endpoint moves under the prefix:
   no prefix, `""`, and `/` all mean "mounted at root", byte-identical to a
   server without the option.
 - The bare-root `GET /` health check answers regardless of the prefix
-  (liveness probes on the raw listener). `GET /{prefix}` answers the same
-  version line as `GET /db/{name}` — a "does this mount resolve" probe,
-  gated by auth when configured.
+  (liveness probes on the raw listener). `GET /{prefix}` answers the version
+  line — a "does this mount resolve" probe, gated by auth when configured.
 - Clients need nothing new: the base path in the client URL
   (`http://host:port/db`) is prepended to every request target, so a
   mounted server is addressed exactly like a root-mounted one at a deeper
@@ -111,33 +106,17 @@ endpoint moves under the prefix:
   approaches are mutually exclusive (don't strip at the proxy *and*
   configure the prefix on the server).
 
-## Multiple databases
+## Serving several databases
 
-One server can serve many buckets. Each registered database `{name}` is
-served under a path prefix:
-
-```
-/db/{name}/ltx/{level}...      /db/{name}/stream?seek=...      etc.
-```
-
-Everything after the prefix routes exactly like the root-bucket endpoints
-below — same grammar, same status codes, same semantics. The root paths
-(`/ltx/...`, `/stream`) serve the server's root bucket; a server started
-multi-only (no root bucket) answers `404 no such db` for them.
-
-- Names match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`: they can never collide
-  with the root endpoints and need no percent-encoding.
-- An unknown name is `404` with body `no such db`.
-- `GET /db/{name}` (no further path) answers the same version line as
-  `GET /` — a handy probe that a name resolves.
-- Registration is dynamic (`add_db`/`remove_db` while serving). Removal
-  stops **new** requests; in-flight requests — including open `/stream`s —
-  may finish against the removed bucket. Each bucket has its own change
-  notification, so a push to one database never wakes another's `/stream`
-  followers.
-- Clients need nothing new: the base-path support in the URL
-  (`http://host:port/db/{name}`) addresses one bucket of a multi-DB server
-  exactly like a dedicated server.
+A server serves exactly **one** database. To serve several, run several
+servers (each `HttpServer::bind` opens its own listener/port), or — to keep
+one listener — embed the transport-agnostic handler `Mount` in your own Rust
+HTTP server and let its router dispatch by path (see Serving). Each mount is
+fully independent: its own writer lease, its own `/stream` change signal (a
+push to one never wakes another's followers), its own auth/writable config.
+Give each a distinct URL — a distinct port, or a distinct mount prefix
+(Mount path) that a reverse proxy or your router maps to the right mount —
+and clients address it through the client URL's base path.
 
 ## Endpoints
 
@@ -432,17 +411,35 @@ latency. Serving an S3-backed `ReplicaClient` works but is not recommended:
 that backend buffers whole objects in memory and serializes calls on a
 private runtime.
 
-Serving many databases from one listener uses the multi-DB registry
-(see Multiple databases for the routing rules):
+`HttpServer` is a thin `TcpListener` driver over `Mount`, the
+transport-agnostic handler that *is* the protocol for one database. To serve
+liters from your own Rust HTTP server (one listener shared with unrelated
+routes, or several databases dispatched by path), build a `Mount` and call
+`Mount::handle` per request:
 
 ```rust
-let srv = HttpServer::bind_multi("0.0.0.0:9736", HttpServerOptions::default())?;
-srv.add_db("app", Arc::new(DirReplicaClient::new(bucket)))?;
+let mount = Mount::new(Arc::new(DirReplicaClient::new(bucket)), MountOptions::default());
 let mut w = Writer::open("app.db",
-                         srv.notifying_client_for("app", Box::new(DirReplicaClient::new(bucket)))?,
+                         mount.notifying_client(Box::new(DirReplicaClient::new(bucket))),
                          WriterOptions::default())?;
-// followers point at http://host:9736/db/app
+// in your router, for a request the router has matched to this mount:
+let resp = mount.handle(Request {
+    method, path,      // `path` has your mount prefix already stripped
+    query, headers,
+    body: &mut req_body,   // decoded (de-chunked / length-bounded); only read for PUT
+    cancel,                // cancels a parked /stream
+});
+// write resp.status + resp.headers (+ your framing), then the Body:
+//   Body::Bytes(b)   -> content-length body
+//   Body::Reader(r)  -> stream it out (chunked); a read error means abort, not a short file
+//   Body::Stream(s)  -> s.write_to(&mut your_chunked_sink); Ok = clean end, Err = abort
 ```
+
+All wire-format knowledge (status codes, listing lines, the frame grammar,
+the `x-liters-protocol` header) lives in `Mount`; the host supplies parsed
+request parts and pumps bytes. `/stream` and file `GET`s must egress as
+HTTP/1.1 chunked, unbuffered (the reference client requires a chunked
+reader). See the `mount` module docs.
 
 ## Following
 
@@ -457,7 +454,7 @@ Auth tokens, fencing identity, and timeouts are per-client options:
 
 ```rust
 let client = Box::new(HttpReplicaClient::with_options(
-    "http://host:9736/db/app",
+    "http://host:9736/db",   // base path if the server is mounted under /db
     HttpClientOptions { auth_token: Some(token), ..HttpClientOptions::default() },
 )?);
 ```

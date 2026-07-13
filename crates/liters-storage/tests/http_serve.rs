@@ -12,8 +12,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use liters_storage::{
-    DirReplicaClient, HttpReplicaClient, HttpServer, HttpServerOptions, LtxStream, ReplicaClient,
-    StorageError, StreamEvent,
+    Body, CancelToken, DirReplicaClient, HttpReplicaClient, HttpServer, HttpServerOptions,
+    LtxStream, Mount, MountOptions, ReplicaClient, Request, StorageError, StreamEvent,
 };
 use ltx::{format_filename, Txid};
 
@@ -652,27 +652,103 @@ fn root_client_against_mounted_server_errors() {
 }
 
 #[test]
-fn mount_prefix_composes_with_multi_db() {
+fn mount_prefix_composes_with_a_deeper_path() {
+    // A multi-segment prefix still routes: the single bucket lives under the
+    // whole /api/v1 mount, and shallower/sibling paths are 404.
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    let app = root.join("app");
-    seed_file(&app, 0, 1, 1, &pattern(3, 128));
+    seed_file(tmp.path(), 0, 1, 1, &pattern(3, 128));
 
-    let opts = HttpServerOptions { base_path: Some("/api".into()), ..test_opts() };
-    let mut srv = HttpServer::bind_multi("127.0.0.1:0", opts).unwrap();
-    srv.add_db("app", Arc::new(DirReplicaClient::new(&app))).unwrap();
+    let opts = HttpServerOptions { base_path: Some("/api/v1".into()), ..test_opts() };
+    let srv =
+        HttpServer::bind("127.0.0.1:0", Arc::new(DirReplicaClient::new(tmp.path())), opts).unwrap();
     let addr = srv.local_addr();
 
-    // The named bucket lives at /api/db/app (mount prefix + multi-DB prefix).
-    let client = HttpReplicaClient::new(format!("http://{addr}/api/db/app")).unwrap();
+    let client = HttpReplicaClient::new(format!("http://{addr}/api/v1")).unwrap();
     assert_eq!(client.ltx_files(0, Txid(0), false).unwrap().len(), 1);
 
-    // Without the /api prefix, the multi-DB path alone is 404.
-    assert!(raw_get(addr, "/db/app/ltx/0").starts_with("HTTP/1.1 404"), "GET /db/app/ltx/0");
-    // An unknown db under the correct prefix is 404 (no such db).
-    assert!(raw_get(addr, "/api/db/nope/ltx/0").starts_with("HTTP/1.1 404"), "GET /api/db/nope");
+    assert!(raw_get(addr, "/api/v1/ltx/0").starts_with("HTTP/1.1 200"), "GET /api/v1/ltx/0");
+    // A prefix of the mount path is not the mount.
+    assert!(raw_get(addr, "/api/ltx/0").starts_with("HTTP/1.1 404"), "GET /api/ltx/0");
+    // Root-style paths moved under the prefix.
+    assert!(raw_get(addr, "/ltx/0").starts_with("HTTP/1.1 404"), "GET /ltx/0");
 
+    let mut srv = srv;
     srv.shutdown();
+}
+
+#[test]
+fn mount_handles_requests_without_a_server() {
+    // The exposed Mount/Request/Response types work standalone, no socket:
+    // this is how an external Rust HTTP server embeds liters (its router owns
+    // paths and the listener, and it calls Mount::handle per request).
+    let tmp = tempfile::tempdir().unwrap();
+    let body = pattern(4, 512);
+    seed_file(tmp.path(), 0, 1, 1, &body);
+    let mount = Mount::new(Arc::new(DirReplicaClient::new(tmp.path())), MountOptions::default());
+    let mut empty = std::io::empty();
+
+    // Listing → Body::Bytes.
+    let resp = mount.handle(Request {
+        method: "GET",
+        path: "ltx/0",
+        query: "",
+        headers: &[],
+        body: &mut empty,
+        cancel: CancelToken::new(),
+    });
+    assert_eq!(resp.status, 200);
+    let listing = match resp.body {
+        Body::Bytes(b) => String::from_utf8(b).unwrap(),
+        _ => panic!("listing should be Body::Bytes"),
+    };
+    assert!(listing.contains("0000000000000001-0000000000000001.ltx"), "listing: {listing:?}");
+
+    // File bytes → Body::Reader (a finite reader the host streams out).
+    let resp = mount.handle(Request {
+        method: "GET",
+        path: &format!("ltx/0/{}", format_filename(Txid(1), Txid(1))),
+        query: "",
+        headers: &[],
+        body: &mut empty,
+        cancel: CancelToken::new(),
+    });
+    assert_eq!(resp.status, 200);
+    match resp.body {
+        Body::Reader(r) => assert_eq!(read_all(r), body),
+        _ => panic!("file should be Body::Reader"),
+    }
+
+    // A divergent /stream → Body::Stream whose write_to terminates (preamble
+    // + reset), proving the pull sink works without a socket.
+    let resp = mount.handle(Request {
+        method: "GET",
+        path: "stream",
+        query: "seek=000000000000000a", // seek 10, far beyond bucket max 1
+        headers: &[],
+        body: &mut empty,
+        cancel: CancelToken::new(),
+    });
+    assert_eq!(resp.status, 200);
+    let mut out = Vec::new();
+    match resp.body {
+        Body::Stream(s) => s.write_to(&mut out).unwrap(),
+        _ => panic!("stream should be Body::Stream"),
+    }
+    let framed = String::from_utf8(out).unwrap();
+    assert!(framed.starts_with("liters-stream 1\n"), "frames: {framed:?}");
+    assert!(framed.contains("reset "), "frames: {framed:?}");
+
+    // A read-only mount (default) rejects a push before touching the body.
+    let bytes = ltx_bytes(2, 2, 10);
+    let resp = mount.handle(Request {
+        method: "PUT",
+        path: &format!("ltx/0/{}", format_filename(Txid(2), Txid(2))),
+        query: "",
+        headers: &[],
+        body: &mut &bytes[..],
+        cancel: CancelToken::new(),
+    });
+    assert_eq!(resp.status, 403);
 }
 
 // ---------------------------------------------------------------------------

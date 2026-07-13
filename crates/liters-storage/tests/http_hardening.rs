@@ -204,77 +204,37 @@ fn auth_gates_every_route_class() {
 // Multi-DB
 
 #[test]
-fn multi_db_registry_and_isolation() {
+fn separate_servers_are_isolated() {
+    // Multiple databases are served by multiple single-DB servers (one bucket
+    // each). A push to one never appears in the other — physical isolation.
     let tmp_a = tempfile::tempdir().unwrap();
     let tmp_b = tempfile::tempdir().unwrap();
-    let tmp_c = tempfile::tempdir().unwrap();
-    let opts = HttpServerOptions { writable: true, ..test_opts() };
-    let mut srv = HttpServer::bind_multi("127.0.0.1:0", opts).unwrap();
-    let addr = srv.local_addr();
+    let opts = || HttpServerOptions { writable: true, ..test_opts() };
+    let srv_a =
+        HttpServer::bind("127.0.0.1:0", Arc::new(DirReplicaClient::new(tmp_a.path())), opts())
+            .unwrap();
+    let srv_b =
+        HttpServer::bind("127.0.0.1:0", Arc::new(DirReplicaClient::new(tmp_b.path())), opts())
+            .unwrap();
 
-    srv.add_db("a", Arc::new(DirReplicaClient::new(tmp_a.path()))).unwrap();
-    srv.add_db("b", Arc::new(DirReplicaClient::new(tmp_b.path()))).unwrap();
-
-    // Name rules: duplicates and invalid names are rejected.
-    assert!(srv.add_db("a", Arc::new(DirReplicaClient::new(tmp_a.path()))).is_err());
-    for bad in ["", "-leading", ".hidden", "has/slash", "has space", &"x".repeat(129)] {
-        assert!(
-            srv.add_db(bad, Arc::new(DirReplicaClient::new(tmp_a.path()))).is_err(),
-            "name {bad:?} should be rejected"
-        );
-    }
-
-    // A plain HttpReplicaClient with a /db/{name} base speaks to a bare
-    // (proxyless) multi-DB server: full push/list/get/stream cycle on `a`,
-    // fully isolated from `b`.
-    let ca = HttpReplicaClient::new(format!("http://{addr}/db/a")).unwrap();
-    let cb = HttpReplicaClient::new(format!("http://{addr}/db/b")).unwrap();
+    let ca = HttpReplicaClient::new(format!("http://{}", srv_a.local_addr())).unwrap();
+    let cb = HttpReplicaClient::new(format!("http://{}", srv_b.local_addr())).unwrap();
     push(&ca, 0, 1, 1).unwrap();
     assert_eq!(ca.ltx_files(0, Txid(0), false).unwrap().len(), 1);
     assert!(cb.ltx_files(0, Txid(0), false).unwrap().is_empty(), "b sees a's push");
-    assert!(
-        DirReplicaClient::new(tmp_b.path()).ltx_files(0, Txid(0), false).unwrap().is_empty()
-    );
+    assert!(DirReplicaClient::new(tmp_b.path()).ltx_files(0, Txid(0), false).unwrap().is_empty());
+
     let mut body = Vec::new();
     ca.open_ltx_file(0, Txid(1), Txid(1), 0, 0).unwrap().read_to_end(&mut body).unwrap();
     assert_eq!(body, ltx_bytes(1, 1, 200));
-    let mut stream = ca.open_ltx_stream(Txid(1)).unwrap().unwrap();
-    let mut sink = Vec::new();
-    match next_non_idle(stream.as_mut(), &mut sink) {
-        StreamEvent::Ltx(info) => assert_eq!(info.min_txid, Txid(1)),
-        other => panic!("expected Ltx on /db/a stream, got {other:?}"),
-    }
-    drop(stream);
 
-    // Unknown names and the (absent) root bucket 404.
-    let nope = HttpReplicaClient::new(format!("http://{addr}/db/nope")).unwrap();
-    let err = nope.ltx_files(0, Txid(0), false).unwrap_err();
-    assert!(err.to_string().contains("404"), "unknown db: {err}");
-    let root = HttpReplicaClient::new(format!("http://{addr}")).unwrap();
-    let err = root.ltx_files(0, Txid(0), false).unwrap_err();
-    assert!(err.to_string().contains("404"), "rootless server root: {err}");
-
-    // Probes: GET / (health) and GET /db/a answer the version line; an
-    // unknown name 404s.
-    let resp = raw_request(addr, "GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+    // Health probe answers on each server's root.
+    let resp = raw_request(srv_a.local_addr(), "GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
     assert!(resp.contains("liters "), "health: {resp:?}");
-    let resp = raw_request(addr, "GET /db/a HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
-    assert!(resp.starts_with("HTTP/1.1 200") && resp.contains("liters "), "probe: {resp:?}");
-    let resp = raw_request(addr, "GET /db/nope HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
-    assert!(resp.starts_with("HTTP/1.1 404"), "unknown probe: {resp:?}");
 
-    // add_db while serving: immediately routable.
-    srv.add_db("c", Arc::new(DirReplicaClient::new(tmp_c.path()))).unwrap();
-    let cc = HttpReplicaClient::new(format!("http://{addr}/db/c")).unwrap();
-    assert!(cc.ltx_files(0, Txid(0), false).unwrap().is_empty());
-
-    // remove_db stops NEW requests; a second removal reports absence.
-    assert!(srv.remove_db("a"));
-    let err = ca.ltx_files(0, Txid(0), false).unwrap_err();
-    assert!(err.to_string().contains("404"), "removed db still served: {err}");
-    assert!(!srv.remove_db("a"));
-
-    srv.shutdown();
+    let (mut srv_a, mut srv_b) = (srv_a, srv_b);
+    srv_a.shutdown();
+    srv_b.shutdown();
 }
 
 /// Delegating [`ReplicaClient`] wrapper that counts level-0 listing calls:
@@ -336,42 +296,39 @@ impl ReplicaClient for CountingClient {
 }
 
 #[test]
-fn per_bucket_notify_wakes_only_its_stream() {
+fn per_server_notify_wakes_only_its_stream() {
     // Poll and ping are pushed far beyond the deadline, so an `ltx` frame
     // can only be delivered by a notify wake — and a wake from the WRONG
-    // bucket would be visible because a file seeded behind the server's
+    // server would be visible because a file seeded behind the server's
     // back gets delivered by any spurious re-list.
     let tmp_a = tempfile::tempdir().unwrap();
     let tmp_b = tempfile::tempdir().unwrap();
-    let opts = HttpServerOptions {
+    let opts = || HttpServerOptions {
         poll_interval: Duration::from_secs(120),
         ping_interval: Duration::from_secs(120),
         ..HttpServerOptions::default()
     };
-    let mut srv = HttpServer::bind_multi("127.0.0.1:0", opts).unwrap();
-    let addr = srv.local_addr();
     let l0_lists = Arc::new(AtomicU64::new(0));
-    srv.add_db(
-        "a",
+    let srv_a = HttpServer::bind(
+        "127.0.0.1:0",
         Arc::new(CountingClient {
             inner: DirReplicaClient::new(tmp_a.path()),
             l0_lists: Arc::clone(&l0_lists),
         }),
+        opts(),
     )
     .unwrap();
-    srv.add_db("b", Arc::new(DirReplicaClient::new(tmp_b.path()))).unwrap();
-    assert!(srv.notifying_client_for("nope", Box::new(DirReplicaClient::new(tmp_a.path()))).is_err());
-    let na = srv
-        .notifying_client_for("a", Box::new(DirReplicaClient::new(tmp_a.path())))
-        .unwrap();
-    let nb = srv
-        .notifying_client_for("b", Box::new(DirReplicaClient::new(tmp_b.path())))
-        .unwrap();
+    let srv_b =
+        HttpServer::bind("127.0.0.1:0", Arc::new(DirReplicaClient::new(tmp_b.path())), opts())
+            .unwrap();
+    let addr_a = srv_a.local_addr();
+    let na = srv_a.notifying_client(Box::new(DirReplicaClient::new(tmp_a.path())));
+    let nb = srv_b.notifying_client(Box::new(DirReplicaClient::new(tmp_b.path())));
 
     // (1,1) exists before the stream opens: the handler's initial listing
     // round delivers it without any notify.
     push(na.as_ref(), 0, 1, 1).unwrap();
-    let ca = HttpReplicaClient::new(format!("http://{addr}/db/a")).unwrap();
+    let ca = HttpReplicaClient::new(format!("http://{addr_a}")).unwrap();
     let mut stream = ca.open_ltx_stream(Txid(1)).unwrap().unwrap();
     let mut sink = Vec::new();
     match next_non_idle(stream.as_mut(), &mut sink) {
@@ -396,12 +353,12 @@ fn per_bucket_notify_wakes_only_its_stream() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // Bait: (2,2) lands in bucket `a` with NO notify. Only a wake can
-    // deliver it before the 120s poll.
+    // Bait: (2,2) lands in server `a`'s bucket with NO notify. Only a wake
+    // can deliver it before the 120s poll.
     seed_file(tmp_a.path(), 0, 2, 2, &ltx_bytes(2, 2, 200));
 
-    // A push to `b` must not wake `a`'s stream: if notification were
-    // cross-bucket, the woken handler would re-list and deliver the bait.
+    // A push to `b` must not wake `a`'s stream: the two servers have
+    // independent notify signals.
     push(nb.as_ref(), 0, 1, 1).unwrap();
     for _ in 0..3 {
         sink.clear();
@@ -430,7 +387,9 @@ fn per_bucket_notify_wakes_only_its_stream() {
     }
 
     drop(stream);
-    srv.shutdown();
+    let (mut srv_a, mut srv_b) = (srv_a, srv_b);
+    srv_a.shutdown();
+    srv_b.shutdown();
 }
 
 // ---------------------------------------------------------------------------
@@ -812,37 +771,34 @@ fn unmatched_put_drains_body_before_404() {
 // Shutdown vs removed buckets
 
 #[test]
-fn shutdown_wakes_stream_parked_on_removed_bucket() {
-    // A /stream handler deliberately keeps serving a bucket after
-    // remove_db. Shutdown must still be able to wake it out of its
-    // poll_interval wait — with a 120s poll, a missed wake would block
-    // shutdown's join far beyond any mobile background-task budget.
+fn shutdown_wakes_parked_stream() {
+    // A /stream handler parked in its poll_interval wait must be woken by
+    // shutdown — with a 120s poll, a missed wake would block shutdown's join
+    // far beyond any mobile background-task budget.
     let tmp = tempfile::tempdir().unwrap();
     let opts = HttpServerOptions {
         poll_interval: Duration::from_secs(120),
         ping_interval: Duration::from_secs(120),
         ..HttpServerOptions::default()
     };
-    let mut srv = HttpServer::bind_multi("127.0.0.1:0", opts).unwrap();
-    srv.add_db("gone", Arc::new(DirReplicaClient::new(tmp.path()))).unwrap();
+    let mut srv =
+        HttpServer::bind("127.0.0.1:0", Arc::new(DirReplicaClient::new(tmp.path())), opts)
+            .unwrap();
     seed_file(tmp.path(), 0, 1, 1, &ltx_bytes(1, 1, 100));
 
-    let client =
-        HttpReplicaClient::new(format!("http://{}/db/gone", srv.local_addr())).unwrap();
+    let client = HttpReplicaClient::new(format!("http://{}", srv.local_addr())).unwrap();
     let mut stream = client.open_ltx_stream(Txid(1)).unwrap().unwrap();
     let mut sink = Vec::new();
     match next_non_idle(stream.as_mut(), &mut sink) {
         StreamEvent::Ltx(info) => assert_eq!(info.min_txid, Txid(1)),
-        other => panic!("expected Ltx before removal, got {other:?}"),
+        other => panic!("expected Ltx, got {other:?}"),
     }
 
-    // Unregister the bucket while its stream is (about to be) parked in
-    // the 120s wait; the stream keeps serving the removed bucket.
-    assert!(srv.remove_db("gone"));
+    // Let the handler catch up and park in its 120s wait.
     sink.clear();
     match stream.next(&mut sink).unwrap() {
         StreamEvent::Idle { .. } => {} // one ~1s tick: the handler had time to park
-        other => panic!("expected Idle on removed-but-streaming bucket, got {other:?}"),
+        other => panic!("expected Idle on caught-up stream, got {other:?}"),
     }
 
     let start = Instant::now();
@@ -850,8 +806,7 @@ fn shutdown_wakes_stream_parked_on_removed_bucket() {
     let elapsed = start.elapsed();
     assert!(
         elapsed < Duration::from_secs(10),
-        "shutdown blocked {elapsed:?} joining a stream parked on a removed bucket \
-         (poll_interval is 120s)"
+        "shutdown blocked {elapsed:?} joining a parked stream (poll_interval is 120s)"
     );
     drop(stream);
 }

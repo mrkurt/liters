@@ -23,7 +23,10 @@ mod s3;
 pub use cancel::CancelToken;
 pub use dir::DirReplicaClient;
 #[cfg(feature = "http")]
-pub use http::{HttpClientOptions, HttpReplicaClient, HttpServer, HttpServerOptions};
+pub use http::{
+    Body, HttpClientOptions, HttpReplicaClient, HttpServer, HttpServerOptions, Mount, MountOptions,
+    Request, Response, StreamBody,
+};
 #[cfg(feature = "s3")]
 pub use s3::{S3Config, S3ReplicaClient};
 

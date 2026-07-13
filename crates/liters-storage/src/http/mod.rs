@@ -6,10 +6,12 @@
 //! the server, a hand-rolled HTTP/1.1 GET client on the read side.
 
 mod client;
+pub mod mount;
 mod server;
 mod wire;
 
 pub use client::{HttpClientOptions, HttpReplicaClient};
+pub use mount::{Body, Mount, MountOptions, Request, Response, StreamBody};
 pub use server::{HttpServer, HttpServerOptions};
 
 /// Creates an anonymous (created then immediately unlinked) temp file in the

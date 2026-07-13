@@ -134,14 +134,25 @@ impl<W: Write> ChunkedWriter<W> {
         self.inner.write_all(b"\r\n")
     }
 
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-
     /// Terminates the body cleanly. Dropping without `finish` leaves the
     /// peer with an unexpected EOF — that is the deliberate abort signal.
     pub fn finish(mut self) -> io::Result<()> {
         self.inner.write_all(b"0\r\n\r\n")?;
+        self.inner.flush()
+    }
+}
+
+/// Each `write` emits one chunk, so a `StreamBody` (or any producer) can
+/// target `&mut dyn Write` and have its writes framed. `flush` reaches the
+/// wrapped writer; `finish` is still explicit (call it on the concrete type,
+/// or drop to abort).
+impl<W: Write> Write for ChunkedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.chunk(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
 }
