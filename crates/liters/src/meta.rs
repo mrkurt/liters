@@ -129,6 +129,76 @@ impl MetaDir {
         s.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0)
     }
 
+    /// Persists the verified position: the highest TXID this local lineage
+    /// KNOWS it has successfully placed in the bucket (see
+    /// `Writer::ensure_lineage_checked`). Same atomic tmp+fsync+rename
+    /// discipline as the sync-state file; same 16-hex format as the replica's
+    /// `{db}-txid` sidecar. Best-effort at the call sites: a lost update can
+    /// only cause a spurious rebaseline next session, never a missed one.
+    pub fn write_verified_pos(&self, txid: Txid) -> Result<()> {
+        let path = self.root.join("verified-pos");
+        let tmp = self.root.join("verified-pos.tmp");
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&tmp)?;
+            writeln!(f, "{txid}")?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Reads the persisted verified position; `None` when the file is
+    /// absent or malformed, so `Writer::open` can distinguish a meta dir
+    /// that predates the file (litestream's own, or older liters) from one
+    /// whose lineage is genuinely pinned at zero.
+    pub fn read_verified_pos(&self) -> Option<Txid> {
+        let s = fs::read_to_string(self.root.join("verified-pos")).ok()?;
+        Txid::parse(s.trim())
+    }
+
+    /// Returns this database's persisted writer id, generating one (16
+    /// random bytes, lowercase hex) on first use. Stored in the meta dir's
+    /// `writer-id` file with the same atomic tmp+fsync+rename discipline as
+    /// the other meta files, so the id is stable across process restarts and
+    /// survives reinstallation exactly as long as the meta dir does — which
+    /// is the correct fencing semantic: a device restored without its meta
+    /// dir is a new lineage and *should* present as a new writer.
+    // Only the manager's HTTP push registration consumes this today.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    pub fn writer_id(&self) -> Result<String> {
+        let path = self.root.join("writer-id");
+        match fs::read_to_string(&path) {
+            Ok(s) => {
+                let s = s.trim();
+                // Visible-ASCII guard matches the HTTP client's header
+                // validation; a corrupt file regenerates instead of wedging
+                // every future registration.
+                if !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| (0x21..=0x7e).contains(&b))
+                {
+                    return Ok(s.to_string());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        fs::create_dir_all(&self.root)?;
+        let mut bytes = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+        let tmp = self.root.join("writer-id.tmp");
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&tmp)?;
+            writeln!(f, "{id}")?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &path)?;
+        Ok(id)
+    }
+
     /// Wipes the local L0 directory (device-restore rebaseline). (db.go:1430-1438)
     pub fn clear_l0(&self) -> Result<()> {
         let dir = self.l0_dir();
@@ -139,5 +209,25 @@ impl MetaDir {
         }
         fs::create_dir_all(&dir)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writer_id_is_generated_once_and_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = MetaDir::for_db(&tmp.path().join("app.db"));
+
+        let id = meta.writer_id().unwrap();
+        assert_eq!(id.len(), 32);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        // Re-reads (same or a fresh MetaDir over the same db) are stable.
+        assert_eq!(meta.writer_id().unwrap(), id);
+        let again = MetaDir::for_db(&tmp.path().join("app.db"));
+        assert_eq!(again.writer_id().unwrap(), id);
     }
 }

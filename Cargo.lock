@@ -950,8 +950,8 @@ name = "liters-ffi"
 version = "0.1.0"
 dependencies = [
  "liters",
- "liters-storage",
- "ltx",
+ "rusqlite",
+ "tempfile",
  "thiserror",
  "uniffi",
 ]

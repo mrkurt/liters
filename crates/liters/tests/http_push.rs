@@ -19,14 +19,13 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 use std::time::{Duration, Instant};
 
 use liters::{
-    DirReplicaClient, FollowOptions, MaintenanceOptions, Replica, ReplicaClient, ReplicaOptions,
-    Writer, WriterOptions, SNAPSHOT_LEVEL,
+    Backoff, CancelToken, DirReplicaClient, FollowOptions, MaintenanceOptions, Replica,
+    ReplicaClient, ReplicaOptions, Writer, WriterOptions, SNAPSHOT_LEVEL,
 };
 use liters_storage::{HttpReplicaClient, HttpServer, HttpServerOptions};
 use ltx::Txid;
@@ -39,11 +38,17 @@ fn fast_server(writable: bool) -> HttpServerOptions {
         poll_interval: Duration::from_millis(100),
         ping_interval: Duration::from_millis(300),
         writable,
+        ..HttpServerOptions::default()
     }
 }
 
+/// Fixed-delay backoff (no growth, no jitter) so retrying tests keep a
+/// deterministic cadence.
 fn follow_opts(retry: Option<Duration>) -> FollowOptions {
-    FollowOptions { poll_interval: Duration::from_millis(100), retry }
+    FollowOptions {
+        poll_interval: Duration::from_millis(100),
+        retry: retry.map(|d| Backoff { initial: d, max: d, multiplier: 1.0, jitter: 0.0 }),
+    }
 }
 
 /// Aggressive maintenance: compact L1 immediately, prune covered L0s with no
@@ -137,14 +142,14 @@ fn poll_until<T>(
     false
 }
 
-/// Sets the follow() stop flag on drop, so a panic anywhere in a test's
+/// Cancels the follow() token on drop, so a panic anywhere in a test's
 /// scope body can never leave the follower thread running forever (which
 /// would hang the scope join, and CI).
-struct StopGuard<'a>(&'a AtomicBool);
+struct StopGuard<'a>(&'a CancelToken);
 
 impl Drop for StopGuard<'_> {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.cancel();
     }
 }
 
@@ -341,7 +346,7 @@ fn relay_push_in_stream_out() {
     let follower_path = tmp.path().join("follower.db");
     let mut rep = Replica::open(&follower_path, http_client(&srv), ReplicaOptions::default());
 
-    let stop = AtomicBool::new(false);
+    let stop = CancelToken::new();
     let fo = follow_opts(None);
     let (final_txid, converged, res) = std::thread::scope(|s| {
         let follower = s.spawn(|| rep.follow(&stop, &fo));
@@ -358,7 +363,7 @@ fn relay_push_in_stream_out() {
         let converged = poll_until(Duration::from_secs(60), &follower, || {
             sidecar_txid(&follower_path) == last.0
         });
-        stop.store(true, Ordering::SeqCst);
+        stop.cancel();
         (last, converged, follower.join().expect("follower thread panicked"))
     });
     srv.shutdown();
@@ -395,7 +400,7 @@ fn receiver_self_follow_loopback() {
         ReplicaOptions::default(),
     );
 
-    let stop = AtomicBool::new(false);
+    let stop = CancelToken::new();
     let fo = follow_opts(None);
     let (final_txid, converged, res) = std::thread::scope(|s| {
         let follower = s.spawn(|| rep.follow(&stop, &fo));
@@ -411,7 +416,7 @@ fn receiver_self_follow_loopback() {
         let converged = poll_until(Duration::from_secs(60), &follower, || {
             sidecar_txid(&local_copy) == last.0
         });
-        stop.store(true, Ordering::SeqCst);
+        stop.cancel();
         (last, converged, follower.join().expect("follower thread panicked"))
     });
     srv.shutdown();
@@ -425,8 +430,8 @@ fn receiver_self_follow_loopback() {
 }
 
 /// P6: dropping the pusher and reopening on the same source db with a FRESH
-/// HttpReplicaClient resumes cleanly — Writer::open's check_behind_remote
-/// lists the bucket over HTTP and subsequent pushes continue the chain.
+/// HttpReplicaClient resumes cleanly — the first push's lineage check lists
+/// the bucket over HTTP and subsequent pushes continue the chain.
 #[test]
 fn writer_reopen_resumes_over_http() {
     let tmp = tempfile::tempdir().unwrap();
@@ -529,4 +534,76 @@ fn push_to_read_only_server_fails_cleanly() {
     let expect = rows_of(&db_path);
     assert_eq!(expect.len(), 12);
     assert_eq!(rows_of(&replica_path), expect);
+}
+
+/// P8: snapshot()/maintain() must upload the pending L0 backlog BEFORE
+/// PUTting their summary files. The fenced writable server (fencing is
+/// always on for writable servers) rejects any L1..L9 PUT whose max TXID
+/// exceeds the bucket max with a 409, so a snapshot of not-yet-uploaded
+/// local state would fail — and, on backends without the fence, would leave
+/// the bucket's L0 chain behind what the snapshot claims to summarize.
+#[test]
+fn snapshot_and_maintain_upload_backlog_before_summary_puts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (conn, db_path, bucket) = setup(tmp.path());
+
+    let mut srv = HttpServer::bind(
+        "127.0.0.1:0",
+        Arc::new(DirReplicaClient::new(&bucket)),
+        fast_server(true),
+    )
+    .unwrap();
+
+    let mut w = Writer::open(&db_path, http_client(&srv), WriterOptions::default()).unwrap();
+    insert_rows(&conn, "p8-a", 10);
+    assert_eq!(w.push().unwrap().remote_txid, Txid(1));
+
+    // Commits NOT yet pushed: snapshot() itself syncs them into a local L0
+    // (txid 2) and must upload that backlog before the L9 PUT, or the
+    // fence 409s (L9 max 2 > bucket max 1).
+    insert_rows(&conn, "p8-b", 10);
+    let snap = w.snapshot().expect("snapshot against a fenced server must succeed");
+    assert_eq!(snap, Some(Txid(2)));
+
+    let dir = DirReplicaClient::new(&bucket);
+    let l0_max = dir.ltx_files(0, Txid(0), false).unwrap().iter().map(|f| f.max_txid).max();
+    assert_eq!(l0_max, Some(Txid(2)), "the backlog L0 must have been uploaded first");
+    assert!(
+        dir.ltx_files(SNAPSHOT_LEVEL, Txid(0), false)
+            .unwrap()
+            .iter()
+            .any(|f| f.max_txid == Txid(2)),
+        "the snapshot must have landed on L9"
+    );
+
+    // Same through maintain(): more unpushed commits, snapshot due
+    // immediately — the maintain-run snapshot uploads the backlog too.
+    insert_rows(&conn, "p8-c", 10);
+    let opts = MaintenanceOptions {
+        level_intervals: vec![Duration::ZERO],
+        snapshot_interval: Duration::ZERO,
+        snapshot_retention: Duration::from_secs(24 * 60 * 60),
+        l0_retention: Duration::ZERO,
+        retention_enabled: true,
+    };
+    let report = w.maintain(&opts).expect("maintain against a fenced server must succeed");
+    assert_eq!(report.snapshot, Some(Txid(3)), "maintain's snapshot must land: {report:?}");
+    let l0_max = dir.ltx_files(0, Txid(0), false).unwrap().iter().map(|f| f.max_txid).max();
+    assert_eq!(l0_max, Some(Txid(3)), "maintain's snapshot must upload the backlog first");
+
+    // The bucket stays coherent for readers.
+    let replica_path = tmp.path().join("replica.db");
+    let mut rep = Replica::open(&replica_path, http_client(&srv), ReplicaOptions::default());
+    assert_eq!(rep.sync().unwrap().to_txid, Txid(3));
+    srv.shutdown();
+    let expect = rows_of(&db_path);
+    assert_eq!(expect.len(), 30);
+    assert_eq!(rows_of(&replica_path), expect);
+
+    // Oracle gate: stock litestream restores the maintained bucket.
+    if let Some(oracle) = oracle_dir() {
+        let restored = tmp.path().join("restored.db");
+        litestream_restore(&oracle, &bucket, &restored);
+        assert_eq!(rows_of(&restored), expect);
+    }
 }

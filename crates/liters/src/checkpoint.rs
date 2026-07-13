@@ -10,6 +10,8 @@
 //! lock and run a post-copy sync under it (no writer can commit concurrently),
 //! then roll back.
 
+use liters_storage::CancelToken;
+
 use crate::sqlite;
 use crate::verify::read_wal_header;
 use crate::writer::{CheckpointMode, Writer};
@@ -18,12 +20,19 @@ use crate::Result;
 impl Writer {
     /// Runs a checkpoint with the full pre-copy / post-copy protocol.
     /// (db.go:2187-2289)
+    ///
+    /// Deliberately not cancellable: cancellable callers (push_with) check
+    /// their token BEFORE invoking this, and once started the protocol runs
+    /// to completion — abandoning it between the PRAGMA and the post-copy
+    /// would strand the restart boundary and force a needless snapshot.
     pub fn checkpoint(&mut self, mode: CheckpointMode) -> Result<()> {
+        let cancel = CancelToken::new();
+
         // WAL header before, to detect a restart. (db.go:2205)
         let hdr_before = read_wal_header(&self.wal_path)?;
 
         // Pre-copy: capture everything committed so far. (db.go:2216-2220)
-        let outcome = self.verify_and_sync(true)?;
+        let outcome = self.verify_and_sync(true, &cancel)?;
         self.apply_sync_outcome(outcome);
 
         // The checkpoint itself, bracketed by read-lock release/reacquire.
@@ -50,7 +59,7 @@ impl Writer {
             // back so no row is ever visible. (db.go:2260-2266)
             self.conn
                 .execute("INSERT INTO _litestream_lock (id) VALUES (1)", [])?;
-            let outcome = self.verify_and_sync(true)?;
+            let outcome = self.verify_and_sync(true, &cancel)?;
             self.apply_sync_outcome(outcome);
             Ok(())
         })();

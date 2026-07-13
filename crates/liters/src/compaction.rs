@@ -12,14 +12,13 @@
 //!   period, never leaving gaps (deletion stops at the first retained file).
 
 use std::fs::File;
-use std::io::Cursor;
 use std::time::{Duration, SystemTime};
 
 use liters_wal::WalReader;
-use liters_storage::SNAPSHOT_LEVEL;
+use liters_storage::{CancelToken, SNAPSHOT_LEVEL};
 use ltx::{FileInfo, Header, Txid, HEADER_FLAG_NO_CHECKSUM};
 
-use crate::writer::Writer;
+use crate::writer::{TmpGuard, Writer};
 use crate::{Error, Result};
 
 /// Maintenance configuration, defaulted to litestream's. (compaction_level.go:14,
@@ -72,31 +71,54 @@ impl Writer {
     /// Call opportunistically (after pushes, on wifi+charging, etc.); every
     /// step is independently resumable and crash-safe (write-then-delete
     /// ordering throughout).
+    ///
+    /// Equal to [`Writer::maintain_with`] with a token that never cancels.
     pub fn maintain(&mut self, opts: &MaintenanceOptions) -> Result<MaintenanceReport> {
+        self.maintain_with(&CancelToken::new(), opts)
+    }
+
+    /// [`Writer::maintain`], cancellable. The token is installed on the
+    /// storage client and checked between levels, between compaction source
+    /// files, through the snapshot encode, and between retention deletes.
+    /// A cancelled maintain returns [`Error::Cancelled`]; because every step
+    /// is write-then-delete, the abandoned run left the bucket valid and the
+    /// next maintain simply redoes whatever was cut short.
+    pub fn maintain_with(
+        &mut self,
+        cancel: &CancelToken,
+        opts: &MaintenanceOptions,
+    ) -> Result<MaintenanceReport> {
+        self.client.set_cancel(cancel.clone());
+        // Maintenance mutates the bucket (compaction PUTs, retention
+        // DELETEs): the session lineage check must pass first.
+        self.ensure_lineage_checked(cancel)?;
+
         let mut report = MaintenanceReport::default();
         let now = SystemTime::now();
 
         // Compact L(n-1)→L(n) for each configured level that is due.
         for (i, interval) in opts.level_intervals.iter().enumerate() {
+            cancel.check()?;
             let level = (i + 1) as u8;
-            if self.level_due(level, *interval, now)? && self.compact_level(level)? {
+            if self.level_due(level, *interval, now)? && self.compact_level_with(cancel, level)? {
                 report.compacted_levels.push(level);
                 if level == 1 && opts.retention_enabled {
-                    report.deleted += self.enforce_l0_retention(opts.l0_retention, now)?;
+                    report.deleted += self.enforce_l0_retention(opts.l0_retention, now, cancel)?;
                 }
             }
         }
 
         // Snapshot when due.
+        cancel.check()?;
         if self.snapshot_due(opts.snapshot_interval, now)? {
-            if let Some(txid) = self.snapshot()? {
+            if let Some(txid) = self.snapshot_with(cancel)? {
                 report.snapshot = Some(txid);
             }
         }
 
         // Snapshot retention + cascade to lower levels.
         if opts.retention_enabled {
-            report.deleted += self.enforce_retention(opts, now)?;
+            report.deleted += self.enforce_retention(opts, now, cancel)?;
         }
 
         Ok(report)
@@ -128,6 +150,21 @@ impl Writer {
     /// Merges new source-level files into one file at `dst_level`. Returns
     /// false when there is nothing to compact. (compactor.go:104-192)
     pub fn compact_level(&mut self, dst_level: u8) -> Result<bool> {
+        self.compact_level_with(&CancelToken::new(), dst_level)
+    }
+
+    pub(crate) fn compact_level_with(&mut self, cancel: &CancelToken, dst_level: u8) -> Result<bool> {
+        // Install THIS operation's token on the client, like every other
+        // cancellable entry point. Idempotent when reached via maintain_with
+        // (the same token is re-installed); load-bearing for the direct
+        // public compact_level path: a token-aware backend still holds the
+        // previous operation's token, and if that one was cancelled, every
+        // storage call here would return Cancelled forever.
+        self.client.set_cancel(cancel.clone());
+        // No-op when maintain_with already checked; guards the direct
+        // public-entry path (a compaction PUT mutates the bucket).
+        self.ensure_lineage_checked(cancel)?;
+
         let src_level = dst_level - 1;
         let seek = liters_storage::max_ltx_file_info(self.client.as_ref(), dst_level)?
             .map(|f| Txid(f.max_txid.0 + 1))
@@ -143,6 +180,7 @@ impl Writer {
 
         let mut readers = Vec::with_capacity(srcs.len());
         for info in &srcs {
+            cancel.check()?;
             readers.push(self.client.open_ltx_file(
                 src_level,
                 info.min_txid,
@@ -152,24 +190,55 @@ impl Writer {
             )?);
         }
 
+        // Merge into an unlinked spool file, not RAM: device memory stays
+        // O(buffer) however large the merged level grows.
         let mut compactor = ltx::Compactor::new(readers);
         compactor.header_flags = HEADER_FLAG_NO_CHECKSUM;
-        let mut out = Vec::new();
-        compactor.compact(&mut out)?;
+        let mut spool = std::io::BufWriter::new(temp_spool()?);
+        compactor.compact(&mut spool)?;
+        use std::io::{Seek, SeekFrom, Write};
+        spool.flush()?;
+        let mut spool = spool.into_inner().map_err(|e| Error::Other(e.to_string()))?;
+        spool.seek(SeekFrom::Start(0))?;
 
+        cancel.check()?;
         self.client
-            .write_ltx_file(dst_level, min_txid, max_txid, &mut Cursor::new(&out))?;
+            .write_ltx_file(dst_level, min_txid, max_txid, &mut std::io::BufReader::new(spool))?;
         Ok(true)
     }
 
     /// Writes a full-image snapshot of the database at its current synced
     /// position to level 9. Returns None when there is nothing to snapshot
     /// (position zero). (db.go:2337-2480)
+    ///
+    /// Equal to [`Writer::snapshot_with`] with a token that never cancels.
     pub fn snapshot(&mut self) -> Result<Option<Txid>> {
+        self.snapshot_with(&CancelToken::new())
+    }
+
+    /// [`Writer::snapshot`], cancellable: the token is checked before and
+    /// through the encode (every 256 pages) and installed on the storage
+    /// client for the upload. A cancelled snapshot leaves nothing behind
+    /// (spool removed, PUT atomicity is the backend's).
+    pub fn snapshot_with(&mut self, cancel: &CancelToken) -> Result<Option<Txid>> {
+        self.client.set_cancel(cancel.clone());
+        // The snapshot PUT mutates the bucket: lineage check first.
+        self.ensure_lineage_checked(cancel)?;
+
         // Sync first so the snapshot position equals the WAL's committed end.
-        let outcome = self.verify_and_sync(false)?;
+        let outcome = self.verify_and_sync(false, cancel)?;
         let synced_end = outcome.new_wal_size;
         self.apply_sync_outcome(outcome);
+
+        // Upload the pending L0 backlog (the sync above may have grown it)
+        // BEFORE the snapshot PUT: an L9 file summarizes history through its
+        // max TXID, so the bucket's L0 chain must already reach that TXID or
+        // bucket state regresses relative to the snapshot — readers planning
+        // from the L0 listing would miss transactions the snapshot claims,
+        // and a fenced liters HTTP server correctly 409s such a PUT
+        // (docs/http-protocol.md "Fencing": L1..L9 max may not exceed the
+        // bucket max).
+        self.upload(cancel)?;
 
         let pos = self.pos()?;
         if pos.txid.is_zero() {
@@ -193,8 +262,11 @@ impl Writer {
             if wal_offset == 0 { (0, 0) } else { (rd.salt1, rd.salt2) };
 
         // Encode to a local spool file, then upload. (Go streams through a
-        // pipe; a spool keeps the storage call resumable/retryable.)
+        // pipe; a spool keeps the storage call resumable/retryable.) The
+        // guard removes the spool on every exit path, including cancellation.
+        cancel.check()?;
         let spool = self.meta.root().join("snapshot.ltx.tmp");
+        let _spool_guard = TmpGuard(&spool);
         {
             let f = File::create(&spool)?;
             let mut enc = ltx::Encoder::new(std::io::BufWriter::new(f));
@@ -211,20 +283,18 @@ impl Writer {
                 wal_salt2: salt2,
                 ..Default::default()
             })?;
-            self.write_snapshot_pages(&mut enc, &wal_file, commit, &page_map.pages)?;
+            self.write_snapshot_pages(&mut enc, &wal_file, commit, &page_map.pages, cancel)?;
             let (mut w, _, _) = enc.finish()?;
             use std::io::Write;
             w.flush()?;
             w.into_inner().map_err(|e| Error::Other(e.to_string()))?.sync_all()?;
         }
 
-        let result = (|| -> Result<()> {
+        cancel.check()?;
+        {
             let mut f = std::io::BufReader::new(File::open(&spool)?);
             self.client.write_ltx_file(SNAPSHOT_LEVEL, Txid(1), pos.txid, &mut f)?;
-            Ok(())
-        })();
-        let _ = std::fs::remove_file(&spool);
-        result?;
+        }
 
         Ok(Some(pos.txid))
     }
@@ -232,7 +302,12 @@ impl Writer {
     /// Snapshot retention by age (keep the newest even if expired), then a
     /// TXID-floor cascade over levels 1..8, then L0 grace-based deletion.
     /// (db.go:2483-2667, store.go:801-823)
-    fn enforce_retention(&mut self, opts: &MaintenanceOptions, now: SystemTime) -> Result<usize> {
+    fn enforce_retention(
+        &mut self,
+        opts: &MaintenanceOptions,
+        now: SystemTime,
+        cancel: &CancelToken,
+    ) -> Result<usize> {
         let mut deleted = 0usize;
         let cutoff = now.checked_sub(opts.snapshot_retention).unwrap_or(SystemTime::UNIX_EPOCH);
 
@@ -261,12 +336,14 @@ impl Writer {
             }
         }
         deleted += expired.len();
+        cancel.check()?;
         self.client.delete_ltx_files(&expired)?;
 
         // Cascade: delete level 1..8 files wholly below the floor, keeping at
         // least one file per level. (compactor.go:291-337)
         if !floor.is_zero() {
             for level in 1..SNAPSHOT_LEVEL {
+                cancel.check()?;
                 let files = self.client.ltx_files(level, Txid(0), false)?;
                 if files.len() <= 1 {
                     continue;
@@ -281,7 +358,7 @@ impl Writer {
             }
         }
 
-        deleted += self.enforce_l0_retention(opts.l0_retention, now)?;
+        deleted += self.enforce_l0_retention(opts.l0_retention, now, cancel)?;
         Ok(deleted)
     }
 
@@ -289,7 +366,12 @@ impl Writer {
     /// the grace period, stopping at the first file that fails either test so
     /// coverage never gains a gap. The newest L0 file always survives.
     /// (db.go:2545-2667)
-    fn enforce_l0_retention(&mut self, grace: Duration, now: SystemTime) -> Result<usize> {
+    fn enforce_l0_retention(
+        &mut self,
+        grace: Duration,
+        now: SystemTime,
+        cancel: &CancelToken,
+    ) -> Result<usize> {
         let max_l1 = liters_storage::max_ltx_file_info(self.client.as_ref(), 1)?
             .map(|f| f.max_txid)
             .unwrap_or_default();
@@ -317,6 +399,7 @@ impl Writer {
             }
         }
         let n = deletable.len();
+        cancel.check()?;
         self.client.delete_ltx_files(&deletable)?;
         Ok(n)
     }
@@ -330,12 +413,16 @@ impl Writer {
         wal_file: &File,
         commit: u32,
         page_map: &std::collections::HashMap<u32, u64>,
+        cancel: &CancelToken,
     ) -> Result<()> {
         use liters_wal::{ReadAt, WAL_FRAME_HEADER_SIZE};
         let lock_pgno = ltx::lock_pgno(self.page_size);
         let mut data = vec![0u8; self.page_size as usize];
 
         for pgno in 1..=commit {
+            if pgno % 256 == 0 {
+                cancel.check()?;
+            }
             if pgno == lock_pgno {
                 continue;
             }
@@ -354,4 +441,30 @@ impl Writer {
         }
         Ok(())
     }
+}
+
+/// Anonymous read+write spool file in the OS temp dir, unlinked immediately
+/// after creation so the open fd is its only reference and it can never
+/// outlive the process (same idiom as the HTTP client's response spool).
+fn temp_spool() -> Result<File> {
+    let dir = std::env::temp_dir();
+    for attempt in 0u32..16 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path = dir.join(format!(
+            "liters-compact-{}-{nanos:x}-{attempt}.spool",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+            Ok(f) => {
+                let _ = std::fs::remove_file(&path);
+                return Ok(f);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(Error::Other("could not create compaction spool file".into()))
 }

@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use liters_wal::{calc_wal_size, ReadAt, WalError, WalReader, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE};
-use liters_storage::ReplicaClient;
-use ltx::{Encoder, Header, Pos, Txid, HEADER_FLAG_NO_CHECKSUM};
+use liters_storage::{CancelToken, ReplicaClient};
+use ltx::{Encoder, FileInfo, Header, Pos, Txid, HEADER_FLAG_NO_CHECKSUM};
 use rusqlite::Connection;
 
 use crate::meta::MetaDir;
@@ -99,11 +99,33 @@ pub struct Writer {
     pub(crate) cached_pos: Option<Pos>,
     /// Bucket-side max L0 TXID; None = unknown, re-derive by listing.
     pub(crate) remote_txid: Option<Txid>,
+    /// Highest TXID this local lineage KNOWS it has successfully placed in
+    /// the bucket (persisted in the meta dir's `verified-pos` file). Drives
+    /// the lineage check; see [`Writer::ensure_lineage_checked`].
+    pub(crate) verified_pos: Txid,
+    /// True when `verified_pos` was seeded from local L0 evidence because the
+    /// meta dir predates the `verified-pos` file (litestream-Go handoff, or
+    /// pre-verified-pos liters). A provisional baseline may legitimately sit
+    /// AHEAD of the bucket (offline backlog), so the lineage check compares
+    /// it with litestream's original `remote > local` rule and then migrates
+    /// to the persisted scheme; a non-provisional baseline is exact, so any
+    /// bucket max other than it (ahead OR behind) is foreign data.
+    pub(crate) verified_pos_provisional: bool,
+    /// Whether the lineage check has succeeded this session. `upload()` must
+    /// never run before it has.
+    pub(crate) lineage_checked: bool,
 }
 
 impl Writer {
     /// Opens a writer against a live database. The database file must exist.
     /// (db.go init, 965-1081)
+    ///
+    /// Performs NO network I/O: a writer can be constructed with the bucket
+    /// unreachable, and pushes accumulate local L0 files until it becomes
+    /// reachable (the first successful push then uploads the backlog). The
+    /// device-restore check litestream runs at open (db.go:1400-1483) is
+    /// deferred to the first bucket mutation; see
+    /// [`Writer::ensure_lineage_checked`].
     pub fn open(
         db_path: impl Into<PathBuf>,
         client: Box<dyn ReplicaClient>,
@@ -142,7 +164,28 @@ impl Writer {
             synced_since_checkpoint: false,
         };
 
-        let mut w = Writer {
+        // Lineage baseline for ensure_lineage_checked. The verified-pos file
+        // where present; meta dirs that predate it (litestream's own, or
+        // pre-verified-pos liters) fall back to the local L0 evidence — the
+        // newest local L0 is the position that lineage pushed (or was about
+        // to push), which is exactly what litestream's open-time
+        // check_behind_remote compared against, so the Go→Rust handoff does
+        // not read its own bucket as foreign. A genuinely FRESH meta dir (no
+        // file, no L0s) pins the lineage at zero immediately, so L0s
+        // accumulated offline from birth can never masquerade as bucket
+        // lineage when the first contact finds a foreign-seeded bucket.
+        let (verified_pos, verified_pos_provisional) = match meta.read_verified_pos() {
+            Some(t) => (t, false),
+            None => match meta.max_l0_txid()? {
+                Some(t) => (t, true),
+                None => {
+                    meta.write_verified_pos(Txid(0))?;
+                    (Txid(0), false)
+                }
+            },
+        };
+
+        let w = Writer {
             db_path,
             wal_path,
             meta,
@@ -156,10 +199,12 @@ impl Writer {
             state,
             cached_pos: None,
             remote_txid: None,
+            verified_pos,
+            verified_pos_provisional,
+            lineage_checked: false,
         };
 
         w.ensure_wal_exists()?;
-        w.check_behind_remote()?;
         Ok(w)
     }
 
@@ -189,7 +234,23 @@ impl Writer {
     /// Syncs committed WAL content into L0, maybe checkpoints, and uploads
     /// pending L0 files to the bucket. The whole hot path. (db.go syncLocked
     /// + replica.go Sync)
+    ///
+    /// Equal to [`Writer::push_with`] with a token that never cancels.
     pub fn push(&mut self) -> Result<PushResult> {
+        self.push_with(&CancelToken::new())
+    }
+
+    /// [`Writer::push`], cancellable. The token is installed on the storage
+    /// client (so a token-aware backend can interrupt in-flight transfers)
+    /// and checked at every natural boundary: before the WAL sync, every 256
+    /// pages while encoding, before checkpointing, and between uploaded
+    /// files. A cancelled push returns [`Error::Cancelled`] and is
+    /// indistinguishable from a kill-then-restart: staged tmp files are
+    /// cleaned up, completed L0 files persist, and the next push resumes
+    /// exactly where this one stopped (uploads are idempotent PUTs).
+    pub fn push_with(&mut self, cancel: &CancelToken) -> Result<PushResult> {
+        self.client.set_cancel(cancel.clone());
+        cancel.check()?;
         self.ensure_wal_exists()?;
 
         // Logical WAL size for checkpoint thresholds (issue #997).
@@ -199,7 +260,11 @@ impl Writer {
             self.wal_file_size()?
         };
 
-        let outcome = self.verify_and_sync(false)?;
+        // WAL→L0 conversion runs BEFORE the lineage check on purpose: with
+        // the bucket unreachable the check fails, but the conversion must
+        // still land committed WAL content in local L0 files so a later
+        // checkpoint cannot orphan it (offline pushes accumulate a backlog).
+        let outcome = self.verify_and_sync(false, cancel)?;
         let synced = outcome.synced;
         let new_wal_size = outcome.new_wal_size;
         self.apply_sync_outcome(outcome);
@@ -207,12 +272,18 @@ impl Writer {
             self.state.synced_since_checkpoint = true;
         }
 
+        cancel.check()?;
         let mut checkpointed = false;
         if self.opts.auto_checkpoint {
             checkpointed = self.checkpoint_if_needed(orig_wal_size, new_wal_size)?;
         }
 
-        let (uploaded, remote_txid) = self.upload()?;
+        // First bucket mutation of the session: the lineage check must pass
+        // before upload() may run (a rebaseline here discards the L0s the
+        // conversion above created — see ensure_lineage_checked for why that
+        // is the correct outcome).
+        self.ensure_lineage_checked(cancel)?;
+        let (uploaded, remote_txid) = self.upload(cancel)?;
 
         // Uploaded L0s are prunable; always keep the newest (verify needs it).
         self.meta.prune_l0(remote_txid)?;
@@ -226,13 +297,40 @@ impl Writer {
         })
     }
 
+    /// Recovery for [`Error::LocalLtx`]: wipes local L0 state, the cached
+    /// position, and the verified position, so the next push re-derives
+    /// everything from the bucket — rebaselining onto the bucket head (and
+    /// snapshotting right after) when the bucket has data, or snapshotting
+    /// from scratch when it is empty.
+    pub fn reset_local(&mut self) -> Result<()> {
+        // Zero the verified position BEFORE wiping L0: if the wipe fails
+        // midway, a stale high verified-pos over a gapped local L0 chain
+        // would skip the rebaseline and strand low-TXID L0s below the
+        // bucket's cursor forever.
+        self.verified_pos = Txid(0);
+        self.meta.write_verified_pos(Txid(0))?;
+        self.verified_pos_provisional = false;
+        self.lineage_checked = false;
+        self.meta.clear_l0()?;
+        self.invalidate_pos();
+        self.remote_txid = None;
+        self.state.synced_to_wal_end = false;
+        Ok(())
+    }
+
     /// Runs verify() + sync(): the WAL→L0 conversion. State is only mutated
     /// by the caller applying the returned outcome (executor discipline:
-    /// failed syncs must not corrupt state; db_internal_test.go:2252).
-    pub(crate) fn verify_and_sync(&mut self, checkpointing: bool) -> Result<SyncOutcome> {
+    /// failed syncs must not corrupt state; db_internal_test.go:2252) — which
+    /// also makes cancellation mid-encode safe: the tmp file is removed and
+    /// no state moved.
+    pub(crate) fn verify_and_sync(
+        &mut self,
+        checkpointing: bool,
+        cancel: &CancelToken,
+    ) -> Result<SyncOutcome> {
         let pos = self.pos()?;
         let info = verify::verify(&self.meta, &self.wal_path, self.page_size, pos.txid, &self.state)?;
-        self.sync(checkpointing, pos, info)
+        self.sync(checkpointing, pos, info, cancel)
     }
 
     pub(crate) fn apply_sync_outcome(&mut self, outcome: SyncOutcome) {
@@ -246,7 +344,13 @@ impl Writer {
     }
 
     /// WAL→LTX conversion for one push batch. (db.go sync, 1807-2061)
-    fn sync(&mut self, _checkpointing: bool, pos: Pos, mut info: SyncInfo) -> Result<SyncOutcome> {
+    fn sync(
+        &mut self,
+        _checkpointing: bool,
+        pos: Pos,
+        mut info: SyncInfo,
+        cancel: &CancelToken,
+    ) -> Result<SyncOutcome> {
         let mut result = SyncOutcome {
             synced: false,
             pos: None,
@@ -327,9 +431,9 @@ impl Writer {
         })?;
 
         if info.snapshotting {
-            self.write_ltx_from_db(&mut enc, &wal_file, commit, &page_map.pages)?;
+            self.write_ltx_from_db(&mut enc, &wal_file, commit, &page_map.pages, cancel)?;
         } else {
-            self.write_ltx_from_wal(&mut enc, &wal_file, &page_map.pages)?;
+            self.write_ltx_from_wal(&mut enc, &wal_file, &page_map.pages, cancel)?;
         }
 
         let (ltx_file, _, _) = enc.finish()?;
@@ -370,11 +474,15 @@ impl Writer {
         wal_file: &File,
         commit: u32,
         page_map: &std::collections::HashMap<u32, u64>,
+        cancel: &CancelToken,
     ) -> Result<()> {
         let lock_pgno = ltx::lock_pgno(self.page_size);
         let mut data = vec![0u8; self.page_size as usize];
 
         for pgno in 1..=commit {
+            if pgno % 256 == 0 {
+                cancel.check()?;
+            }
             if pgno == lock_pgno {
                 continue;
             }
@@ -394,12 +502,16 @@ impl Writer {
         enc: &mut Encoder<File>,
         wal_file: &File,
         page_map: &std::collections::HashMap<u32, u64>,
+        cancel: &CancelToken,
     ) -> Result<()> {
         let mut pgnos: Vec<u32> = page_map.keys().copied().collect();
         pgnos.sort_unstable();
 
         let mut data = vec![0u8; self.page_size as usize];
-        for pgno in pgnos {
+        for (i, pgno) in pgnos.into_iter().enumerate() {
+            if i % 256 == 0 {
+                cancel.check()?;
+            }
             let offset = page_map[&pgno];
             read_full_at(wal_file, &mut data, offset + WAL_FRAME_HEADER_SIZE)?;
             enc.encode_page(pgno, &data)?;
@@ -409,13 +521,44 @@ impl Writer {
 
     /// Uploads local L0 files the bucket is missing, in TXID order.
     /// (replica.go:134-216)
-    pub(crate) fn upload(&mut self) -> Result<(u64, Txid)> {
+    ///
+    /// Callers must have passed the session lineage check first
+    /// ([`Writer::ensure_lineage_checked`]): appending to an unverified
+    /// bucket could interleave this lineage's TXIDs with a foreign writer's.
+    pub(crate) fn upload(&mut self, cancel: &CancelToken) -> Result<(u64, Txid)> {
+        debug_assert!(self.lineage_checked, "upload() before the session lineage check");
         let remote = match self.remote_txid {
             Some(t) => t,
             None => {
                 let t = liters_storage::max_ltx_file_info(self.client.as_ref(), 0)?
                     .map(|f| f.max_txid)
                     .unwrap_or_default();
+                // Mid-session re-derivation (the cursor was invalidated by an
+                // earlier upload error/cancel). The lineage check ran once at
+                // session start, so re-validate here: `verified_pos` advances
+                // per successfully uploaded file, meaning a bucket max EQUAL
+                // to it is exactly our own data — but a bucket beyond it
+                // holds TXIDs we did not put there (a foreign writer appended
+                // since the check), and a bucket below it lost files we
+                // verified placing (wiped/reseeded). Appending local L0s over
+                // either would interleave two lineages into one chain —
+                // silent corruption for `litestream restore`. Fail the push
+                // (non-transient) and clear the session flag so the NEXT
+                // bucket mutation re-runs ensure_lineage_checked, which owns
+                // the rebaseline/reseed decision. The lost-ack case (our PUT
+                // landed but the response was lost, bucket exactly one ahead
+                // of verified) takes this path too and costs one spurious
+                // rebaseline+snapshot — the documented price of a lost
+                // verified-pos update, never a correctness issue.
+                if t != self.verified_pos {
+                    self.lineage_checked = false;
+                    return Err(Error::Other(format!(
+                        "bucket moved outside this session's verified position \
+                         (bucket at {t}, session verified {}): foreign writer \
+                         suspected; the next push re-runs the lineage check",
+                        self.verified_pos
+                    )));
+                }
                 self.remote_txid = Some(t);
                 t
             }
@@ -425,6 +568,12 @@ impl Writer {
         let mut uploaded = 0u64;
         let mut cursor = remote;
         while cursor < local {
+            // Cancelled between files: re-derive the remote position on the
+            // next push, same as any upload error.
+            if let Err(e) = cancel.check() {
+                self.remote_txid = None;
+                return Err(e.into());
+            }
             let next = Txid(cursor.0 + 1);
             let path = self.meta.l0_path(next);
             let f = match File::open(&path) {
@@ -444,6 +593,17 @@ impl Writer {
             }
             cursor = next;
             self.remote_txid = Some(cursor);
+            // This lineage just placed `next` in the bucket: advance the
+            // verified position immediately (per file, not per push) so that
+            // a kill mid-backlog cannot leave the bucket ahead of what the
+            // lineage remembers verifying — that would read as foreign data
+            // and force a spurious rebaseline next session. Best-effort like
+            // write_sync_state; a lost write costs one extra snapshot, never
+            // correctness.
+            if cursor > self.verified_pos {
+                self.verified_pos = cursor;
+                let _ = self.meta.write_verified_pos(cursor);
+            }
             uploaded += 1;
         }
         Ok((uploaded, cursor))
@@ -460,20 +620,109 @@ impl Writer {
         sqlite::write_seq(&self.conn)
     }
 
-    /// Device-restore protection: if the bucket is ahead of the local
-    /// database (the DB was restored from an older copy), rebaseline local
-    /// L0 state from the bucket so the next push snapshots at remoteMax+1
-    /// instead of colliding TXIDs. (db.go:1400-1483, issue #781)
-    fn check_behind_remote(&mut self) -> Result<()> {
-        let db_pos = self.pos()?;
-        let Some(remote) = liters_storage::max_ltx_file_info(self.client.as_ref(), 0)? else {
-            return Ok(()); // no remote data yet
-        };
-        if remote.max_txid.is_zero() || db_pos.txid >= remote.max_txid {
+    /// Once-per-session lineage check, run lazily before the FIRST bucket
+    /// mutation (uploads, compactions, snapshots, retention) — never at
+    /// open(), so construction and offline pushes need no network.
+    ///
+    /// `verified_pos` is the highest TXID this local lineage KNOWS it has
+    /// placed in the bucket (advanced per uploaded file, persisted in the
+    /// meta dir). Because it only advances after an acknowledged PUT, and
+    /// neither liters retention nor litestream ever deletes the newest L0,
+    /// a bucket whose max L0 TXID differs from it in EITHER direction holds
+    /// a history this lineage did not write:
+    ///
+    /// - **ahead** (`remote_max > verified_pos`): the device was restored
+    ///   from a backup (the bucket kept advancing after the backup was
+    ///   taken) or another writer owns the bucket;
+    /// - **behind but non-empty** (`0 < remote_max < verified_pos`): the
+    ///   bucket was wiped and reseeded by another writer — its files at or
+    ///   below remote_max describe the reseeder's transactions, not ours;
+    /// - **empty** (`remote_max == 0 < verified_pos`): the bucket was wiped
+    ///   outright.
+    ///
+    /// Comparing against `verified_pos` instead of the local position (as
+    /// litestream's open-time check does, db.go:1400-1483) is what keeps the
+    /// check sound with offline-accumulated L0s — a local position ahead of
+    /// the bucket is normal offline backlog, but a bucket that differs from
+    /// what WE verified is always foreign data. (A *provisional* baseline —
+    /// legacy meta dir without a verified-pos file, seeded from local L0
+    /// evidence at open — may legitimately sit ahead of the bucket, so it
+    /// keeps litestream's original `remote > local` rule and is migrated to
+    /// the persisted scheme on its first passing check.)
+    ///
+    /// On foreign data ahead-or-behind (non-empty), rebaseline exactly like
+    /// litestream's device-restore path: clear local L0, adopt the newest
+    /// remote L0 as the baseline, and let the next verify() force the
+    /// snapshot path at remoteMax+1 (the adopted header's wal_offset/salts
+    /// describe a WAL this device never had, so verify takes its
+    /// truncated-WAL or overwritten-WAL branch; `synced_to_wal_end` is
+    /// cleared so the #927 shortcut cannot bypass that). On a wiped-empty
+    /// bucket, reseed from scratch: clear local L0 and zero the verified
+    /// position, so the next push snapshots the full database from TXID 1.
+    /// Either way the rebaseline discards offline-accumulated L0s and the
+    /// next push snapshots — the L0s continued a history the bucket no
+    /// longer tells, and uploading them as incrementals over a foreign base
+    /// would corrupt every restore.
+    ///
+    /// A listing error propagates (transient: the caller retries on its next
+    /// push) and leaves the session unchecked, so upload() still cannot run.
+    /// (Replaces the open-time check_behind_remote; issue #781.)
+    pub(crate) fn ensure_lineage_checked(&mut self, cancel: &CancelToken) -> Result<()> {
+        if self.lineage_checked {
             return Ok(());
         }
+        cancel.check()?;
+        let remote = liters_storage::max_ltx_file_info(self.client.as_ref(), 0)?;
+        let remote_max = remote.as_ref().map(|f| f.max_txid).unwrap_or_default();
 
-        // Clear local L0 and adopt the newest remote L0 as the baseline.
+        let foreign = if self.verified_pos_provisional {
+            // Legacy baseline from local L0 evidence: only a bucket AHEAD of
+            // it is provably foreign (litestream's own open-time rule).
+            remote_max > self.verified_pos
+        } else {
+            remote_max != self.verified_pos
+        };
+
+        if foreign {
+            if let Some(remote) = &remote {
+                self.rebaseline_from_remote(cancel, remote)?;
+            } else {
+                // Wiped bucket (empty, but this lineage verified placing
+                // files in it): full reseed. Clearing L0 zeroes the local
+                // position, so the next push snapshots from TXID 1.
+                self.meta.clear_l0()?;
+                self.invalidate_pos();
+                self.state.synced_to_wal_end = false;
+            }
+            self.verified_pos = remote_max;
+            // Best-effort like write_sync_state: a lost write can only cause
+            // a spurious re-rebaseline next session, never a missed one.
+            let _ = self.meta.write_verified_pos(remote_max);
+        } else {
+            // A passing check proves the bucket's contents (all at or below
+            // remote_max) came from this lineage. Align the baseline to what
+            // the bucket itself proves — for a provisional (legacy) baseline
+            // this lowers the in-memory value to remote_max, so upload()'s
+            // per-file `cursor > verified_pos` persistence fires for the
+            // backlog (local L0s beyond remote_max are unverified until
+            // uploaded) — and migrate/repair the verified-pos file where it
+            // is absent or stale.
+            self.verified_pos = remote_max;
+            if self.meta.read_verified_pos() != Some(remote_max) {
+                let _ = self.meta.write_verified_pos(remote_max);
+            }
+        }
+        self.verified_pos_provisional = false;
+        self.remote_txid = Some(remote_max);
+        self.lineage_checked = true;
+        Ok(())
+    }
+
+    /// Device-restore rebaseline: wipe local L0 state and adopt the newest
+    /// remote L0 as the local baseline so the next push snapshots at
+    /// remoteMax+1 instead of colliding TXIDs. (db.go:1400-1483, issue #781)
+    fn rebaseline_from_remote(&mut self, cancel: &CancelToken, remote: &FileInfo) -> Result<()> {
+        cancel.check()?;
         self.meta.clear_l0()?;
         self.invalidate_pos();
 
@@ -482,13 +731,22 @@ impl Writer {
             .open_ltx_file(0, remote.min_txid, remote.max_txid, 0, 0)?;
         let local_path = self.meta.l0_path(remote.max_txid);
         let tmp_path = local_path.with_extension("ltx.tmp");
+        let tmp_guard = TmpGuard(&tmp_path);
         {
             let mut f = File::create(&tmp_path)?;
             std::io::copy(&mut rd, &mut f)?;
             f.sync_all()?;
         }
         std::fs::rename(&tmp_path, &local_path)?;
+        drop(tmp_guard);
         self.invalidate_pos();
+
+        // The adopted baseline voids the assumption behind the #927
+        // expected-truncation shortcut: a `synced_to_wal_end` left true by a
+        // sync earlier in this session described the DISCARDED lineage, and
+        // carrying it over would let verify() resume incrementally from the
+        // local WAL top over a foreign pre-state instead of snapshotting.
+        self.state.synced_to_wal_end = false;
         Ok(())
     }
 
@@ -538,7 +796,7 @@ impl Drop for Writer {
 
 /// Deletes the tmp file on drop; disarmed by successful rename (the rename
 /// makes the delete a no-op on the moved path).
-struct TmpGuard<'a>(&'a Path);
+pub(crate) struct TmpGuard<'a>(pub(crate) &'a Path);
 
 impl Drop for TmpGuard<'_> {
     fn drop(&mut self) {

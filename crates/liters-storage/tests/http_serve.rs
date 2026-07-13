@@ -5,7 +5,7 @@
 #![cfg(feature = "http")]
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -553,6 +553,129 @@ fn health_check_root_endpoint() {
 }
 
 // ---------------------------------------------------------------------------
+// Mount prefix: the server serves every endpoint under a URL path prefix so
+// it can share an origin with unrelated apps. docs/http-protocol.md "Mount
+// path".
+
+/// Serves `root` under the `base` mount prefix and returns a client whose URL
+/// carries the matching base path.
+fn serve_mounted(root: &Path, base: &str) -> (HttpServer, HttpReplicaClient) {
+    let opts = HttpServerOptions { base_path: Some(base.to_string()), ..test_opts() };
+    let srv =
+        HttpServer::bind("127.0.0.1:0", Arc::new(DirReplicaClient::new(root)), opts).unwrap();
+    let client =
+        HttpReplicaClient::new(format!("http://{}{}", srv.local_addr(), base)).unwrap();
+    (srv, client)
+}
+
+/// Sends a bare `GET {target}` on its own connection and returns the whole
+/// response as text (status line included).
+fn raw_get(addr: SocketAddr, target: &str) -> String {
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(sock, "GET {target} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").unwrap();
+    let mut resp = Vec::new();
+    sock.read_to_end(&mut resp).unwrap();
+    String::from_utf8_lossy(&resp).into_owned()
+}
+
+#[test]
+fn mount_prefix_serves_under_base_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let body = pattern(7, 2000);
+    seed_file(root, 0, 1, 1, &body);
+    seed_file(root, 0, 2, 2, &pattern(2, 300));
+    let (mut srv, http) = serve_mounted(root, "/db");
+
+    // Listing and ranged/whole file reads all work through the /db mount —
+    // the client prepends its base path, the server strips it.
+    let infos = http.ltx_files(0, Txid(0), false).unwrap();
+    assert_eq!(infos.len(), 2);
+    assert_eq!(read_all(http.open_ltx_file(0, Txid(1), Txid(1), 0, 0).unwrap()), body);
+    assert_eq!(read_all(http.open_ltx_file(0, Txid(1), Txid(1), 100, 500).unwrap()), &body[100..600]);
+
+    // And so does /stream.
+    let mut stream = http.open_ltx_stream(Txid(1)).unwrap().unwrap();
+    let mut sink = Vec::new();
+    match next_non_idle(stream.as_mut(), &mut sink) {
+        StreamEvent::Ltx(info) => {
+            assert_eq!((info.min_txid, info.max_txid), (Txid(1), Txid(1)));
+            assert_eq!(sink, body);
+        }
+        other => panic!("expected Ltx, got {other:?}"),
+    }
+    drop(stream);
+    srv.shutdown();
+}
+
+#[test]
+fn mount_prefix_rejects_paths_outside_the_mount() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_file(tmp.path(), 0, 1, 1, &pattern(1, 100));
+    let (mut srv, _http) = serve_mounted(tmp.path(), "/db");
+    let addr = srv.local_addr();
+
+    // Bare-root health check answers regardless of the mount prefix.
+    assert!(raw_get(addr, "/").starts_with("HTTP/1.1 200"), "GET /");
+    // The mount root answers the version line (a "does this mount resolve"
+    // probe, mirroring GET /db/{name}).
+    assert!(raw_get(addr, "/db").starts_with("HTTP/1.1 200"), "GET /db");
+    // The real endpoint under the mount works.
+    let ok = raw_get(addr, "/db/ltx/0");
+    assert!(ok.starts_with("HTTP/1.1 200"), "GET /db/ltx/0: {ok:?}");
+
+    // A sibling app's path is not ours: 404.
+    assert!(raw_get(addr, "/users/ltx/0").starts_with("HTTP/1.1 404"), "GET /users/ltx/0");
+    // Root-style liters requests are 404 — the endpoints moved under /db.
+    assert!(raw_get(addr, "/ltx/0").starts_with("HTTP/1.1 404"), "GET /ltx/0");
+    assert!(raw_get(addr, "/stream?seek=0000000000000001").starts_with("HTTP/1.1 404"), "GET /stream");
+
+    srv.shutdown();
+}
+
+#[test]
+fn root_client_against_mounted_server_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_file(tmp.path(), 0, 1, 1, &pattern(1, 100));
+    let (mut srv, _mounted) = serve_mounted(tmp.path(), "/db");
+
+    // A client with no base path hits /ltx/0 -> 404; a listing maps any
+    // non-200 to Other (404 is NotFound only on file GETs), so the
+    // misconfiguration surfaces loudly rather than looking like an empty
+    // bucket.
+    let root_client = HttpReplicaClient::new(format!("http://{}", srv.local_addr())).unwrap();
+    let err = root_client.ltx_files(0, Txid(0), false).unwrap_err();
+    assert!(err.to_string().contains("404"), "unexpected error: {err}");
+
+    srv.shutdown();
+}
+
+#[test]
+fn mount_prefix_composes_with_multi_db() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let app = root.join("app");
+    seed_file(&app, 0, 1, 1, &pattern(3, 128));
+
+    let opts = HttpServerOptions { base_path: Some("/api".into()), ..test_opts() };
+    let mut srv = HttpServer::bind_multi("127.0.0.1:0", opts).unwrap();
+    srv.add_db("app", Arc::new(DirReplicaClient::new(&app))).unwrap();
+    let addr = srv.local_addr();
+
+    // The named bucket lives at /api/db/app (mount prefix + multi-DB prefix).
+    let client = HttpReplicaClient::new(format!("http://{addr}/api/db/app")).unwrap();
+    assert_eq!(client.ltx_files(0, Txid(0), false).unwrap().len(), 1);
+
+    // Without the /api prefix, the multi-DB path alone is 404.
+    assert!(raw_get(addr, "/db/app/ltx/0").starts_with("HTTP/1.1 404"), "GET /db/app/ltx/0");
+    // An unknown db under the correct prefix is 404 (no such db).
+    assert!(raw_get(addr, "/api/db/nope/ltx/0").starts_with("HTTP/1.1 404"), "GET /api/db/nope");
+
+    srv.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // Push (reversed roles): the server accepts replication, a remote client
 // pushes. docs/http-protocol.md "Push".
 
@@ -629,6 +752,52 @@ fn push_roundtrip_matches_dir_backend() {
 }
 
 #[test]
+fn push_through_mount_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let dir = DirReplicaClient::new(root);
+    let opts =
+        HttpServerOptions { writable: true, base_path: Some("/db".into()), ..test_opts() };
+    let mut srv =
+        HttpServer::bind("127.0.0.1:0", Arc::new(DirReplicaClient::new(root)), opts).unwrap();
+    let http = HttpReplicaClient::new(format!("http://{}/db", srv.local_addr())).unwrap();
+
+    // Push, delete, and delete_all all route through the mount prefix.
+    let bytes = ltx_bytes(1, 1, 500);
+    let info = http.write_ltx_file(0, Txid(1), Txid(1), &mut &bytes[..]).unwrap();
+    assert_eq!(info.size, bytes.len() as u64);
+    assert_eq!(read_all(dir.open_ltx_file(0, Txid(1), Txid(1), 0, 0).unwrap()), bytes);
+
+    http.delete_ltx_files(&[info]).unwrap();
+    assert!(dir.ltx_files(0, Txid(0), false).unwrap().is_empty());
+
+    // A PUT to a path outside the mount is 404 and, critically, its body is
+    // drained so the response is delivered on a clean FIN (not lost to an
+    // RST) — a misdirected pusher gets a real status, not a broken pipe.
+    let full = ltx_bytes(2, 2, 400);
+    let mut sock = TcpStream::connect(srv.local_addr()).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(
+        sock,
+        "PUT /ltx/0/{} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        format_filename(Txid(2), Txid(2)),
+        full.len()
+    )
+    .unwrap();
+    sock.write_all(&full).unwrap();
+    sock.flush().unwrap();
+    let mut resp = String::new();
+    let _ = sock.read_to_string(&mut resp);
+    assert!(resp.starts_with("HTTP/1.1 404"), "expected 404 for off-mount PUT, got {resp:?}");
+    drop(sock);
+
+    // Nothing landed off-mount.
+    assert!(dir.ltx_files(0, Txid(0), false).unwrap().is_empty());
+
+    srv.shutdown();
+}
+
+#[test]
 fn read_only_server_rejects_writes() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut srv, http) = serve(tmp.path()); // default opts: writable false
@@ -673,6 +842,7 @@ fn accepted_push_wakes_stream_followers() {
         poll_interval: Duration::from_secs(120),
         ping_interval: Duration::from_secs(120),
         writable: true,
+        ..HttpServerOptions::default()
     };
     let mut srv =
         HttpServer::bind("127.0.0.1:0", Arc::new(DirReplicaClient::new(tmp.path())), opts)

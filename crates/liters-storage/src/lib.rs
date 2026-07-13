@@ -13,15 +13,17 @@
 //! litestream's `file` client, so stock `litestream restore file://…` works
 //! against it); the S3 backend implements the second.
 
+mod cancel;
 mod dir;
 #[cfg(feature = "http")]
 mod http;
 #[cfg(feature = "s3")]
 mod s3;
 
+pub use cancel::CancelToken;
 pub use dir::DirReplicaClient;
 #[cfg(feature = "http")]
-pub use http::{HttpReplicaClient, HttpServer, HttpServerOptions};
+pub use http::{HttpClientOptions, HttpReplicaClient, HttpServer, HttpServerOptions};
 #[cfg(feature = "s3")]
 pub use s3::{S3Config, S3ReplicaClient};
 
@@ -48,8 +50,39 @@ pub enum StorageError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    /// Transient transport failure: connect/resolve failure, socket timeout,
+    /// connection reset, stream dead-man, truncated body. Safe to retry.
+    #[error("storage unavailable: {0}")]
+    Unavailable(String),
+
+    /// Authentication required or rejected.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
+    /// The server rejected a write for consistency/ownership reasons
+    /// (TXID non-monotonic, writer fenced). NOT retryable as-is.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
+    /// The server is read-only.
+    #[error("read-only: {0}")]
+    ReadOnly(String),
+
+    /// The operation was cancelled via [`CancelToken`].
+    #[error("operation cancelled")]
+    Cancelled,
+
     #[error("{0}")]
     Other(String),
+}
+
+impl StorageError {
+    /// Whether retrying the same operation later can plausibly succeed:
+    /// transport failures and I/O errors. Protocol, auth, consistency, and
+    /// cancellation errors are not transient.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, StorageError::Unavailable(_) | StorageError::Io(_))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -104,6 +137,12 @@ pub trait ReplicaClient: Send + Sync {
         let _ = seek;
         Ok(None)
     }
+
+    /// Installs a cancellation token observed by subsequent blocking
+    /// operations on this client (best-effort granularity; backends may only
+    /// check between operations). Passing a fresh token replaces the old
+    /// one. Default: no-op.
+    fn set_cancel(&self, _token: CancelToken) {}
 }
 
 /// A live change stream of complete level-0 LTX files, as produced by

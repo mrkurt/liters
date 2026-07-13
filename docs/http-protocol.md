@@ -17,14 +17,16 @@ level-0 LTX files to a follower over a single connection.
 - HTTP/1.1, `Connection: close` (one request per connection). Read
   endpoints are `GET`; a *writable* server (see Push below) additionally
   accepts `PUT`/`DELETE` on the write endpoints. Anything else is `405`.
-- No TLS and no authentication in v1. Bind loopback or a private interface,
-  or front with a reverse proxy. Proxies MUST NOT buffer `/stream`
-  responses: the server sends `X-Accel-Buffering: no` and
-  `Cache-Control: no-cache, no-transform`; for nginx set
-  `proxy_buffering off` and `proxy_read_timeout` greater than the ping
-  interval (default 15s).
+- No TLS in v1. Bind loopback or a private interface, or front with a
+  reverse proxy. Proxies MUST NOT buffer `/stream` responses: the server
+  sends `X-Accel-Buffering: no` and `Cache-Control: no-cache,
+  no-transform`; for nginx set `proxy_buffering off` and
+  `proxy_read_timeout` greater than the ping interval (default 15s).
+- Optional bearer-token authentication (see Authentication below). Without
+  a configured token the server behaves exactly as before auth existed.
 - No percent-encoding anywhere: paths and query values are plain lowercase
-  hex and decimal.
+  hex and decimal (DB names are restricted to a safe charset — see
+  Multiple databases).
 - Line-length cap: 8192 bytes for any protocol line (request line, header,
   listing line, frame line) in either direction.
 
@@ -35,11 +37,107 @@ level-0 LTX files to a follower over a single connection.
   means "not a liters server", a different value means "incompatible
   protocol". This keeps proxies and foreign servers from being misparsed.
 - Any change to the listing format, the frame grammar, the set of frame
-  types, or the endpoint/method set bumps the version. The write endpoints
-  (Push) are part of v1. The `level` field of `ltx` frames is the only
-  in-version extension point (always `0` in v1).
+  types, or the meaning of an existing endpoint/method bumps the version.
+  The write endpoints (Push) are part of v1. The `level` field of `ltx`
+  frames is the only in-version extension point (always `0` in v1).
+- Purely *additive* surface does not bump the version: optional request
+  headers (`authorization`, the fencing headers), new path prefixes
+  (`/db/{name}`), and an operator-configured mount prefix (see Mount path)
+  are ignored-or-404 on servers that predate them, and clients that never
+  send them observe byte-identical behavior. Authentication, multi-DB
+  routing, the mount prefix, and fencing are all such additions — a v1
+  server with none of them configured behaves exactly as before they
+  existed.
 - Servers ignore unknown query parameters, so older servers tolerate newer
   clients.
+
+## Authentication
+
+A server configured with an auth token (`HttpServerOptions::auth_token`)
+requires
+
+```
+authorization: Bearer <token>
+```
+
+on **every** route except the `GET /` health check (liveness probes carry
+no secrets; note that `GET /db/{name}` probes ARE gated — whether a name
+exists is information). The scheme is matched case-insensitively; the token
+must match exactly. Anything missing or wrong is `401` with body
+`authorization required`; rejected `PUT` bodies get the same bounded drain
+treatment as `403` so the response survives the unread body. Auth is
+checked before DB resolution, so an unauthorized request cannot distinguish
+existing from unknown names.
+
+Tokens (and writer ids, see Fencing) must be visible ASCII
+(`0x21..=0x7e`); the reference client rejects anything else at
+construction, since values are interpolated into request heads verbatim.
+
+Auth without TLS protects against unauthorized *access*, not snooping —
+the token crosses the wire in clear text. Front with a TLS-terminating
+proxy when the transport is untrusted.
+
+## Mount path
+
+A server may be mounted under a URL path prefix
+(`HttpServerOptions::base_path`, e.g. `/db`) so it can share an origin with
+unrelated apps behind a path-routing reverse proxy — `http://host/db/...`
+reaches liters while `http://host/users/...` reaches something else. Every
+endpoint moves under the prefix:
+
+```
+/db/ltx/{level}...   /db/stream?seek=...   /db/db/{name}/...   /db/all   etc.
+```
+
+- The prefix is stripped before routing, so the root-bucket and
+  `/db/{name}` multi-DB layouts are unchanged beneath it (multi-DB thus
+  lands at `/{prefix}/db/{name}/...`).
+- A request whose path is **not** under the prefix is `404 not found`
+  (checked after auth, so the prefix layout is not probeable without the
+  token). PUT bodies on such requests get the same bounded drain as any
+  other error, so a misdirected pusher receives a real status.
+- Leading/trailing slashes are optional and interior `//` is collapsed;
+  no prefix, `""`, and `/` all mean "mounted at root", byte-identical to a
+  server without the option.
+- The bare-root `GET /` health check answers regardless of the prefix
+  (liveness probes on the raw listener). `GET /{prefix}` answers the same
+  version line as `GET /db/{name}` — a "does this mount resolve" probe,
+  gated by auth when configured.
+- Clients need nothing new: the base path in the client URL
+  (`http://host:port/db`) is prepended to every request target, so a
+  mounted server is addressed exactly like a root-mounted one at a deeper
+  URL. If a reverse proxy instead *strips* the prefix before forwarding,
+  leave `base_path` unset and give clients the external URL — the two
+  approaches are mutually exclusive (don't strip at the proxy *and*
+  configure the prefix on the server).
+
+## Multiple databases
+
+One server can serve many buckets. Each registered database `{name}` is
+served under a path prefix:
+
+```
+/db/{name}/ltx/{level}...      /db/{name}/stream?seek=...      etc.
+```
+
+Everything after the prefix routes exactly like the root-bucket endpoints
+below — same grammar, same status codes, same semantics. The root paths
+(`/ltx/...`, `/stream`) serve the server's root bucket; a server started
+multi-only (no root bucket) answers `404 no such db` for them.
+
+- Names match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`: they can never collide
+  with the root endpoints and need no percent-encoding.
+- An unknown name is `404` with body `no such db`.
+- `GET /db/{name}` (no further path) answers the same version line as
+  `GET /` — a handy probe that a name resolves.
+- Registration is dynamic (`add_db`/`remove_db` while serving). Removal
+  stops **new** requests; in-flight requests — including open `/stream`s —
+  may finish against the removed bucket. Each bucket has its own change
+  notification, so a push to one database never wakes another's `/stream`
+  followers.
+- Clients need nothing new: the base-path support in the URL
+  (`http://host:port/db/{name}`) addresses one bucket of a multi-DB server
+  exactly like a dedicated server.
 
 ## Endpoints
 
@@ -136,14 +234,22 @@ new frame types require a version bump.
 
 ### Timing (informative defaults)
 
+The client-side values are the `HttpClientOptions` defaults
+(`connect_timeout` 10s, `io_timeout` 30s, `stream_deadman` 45s) and are
+configurable per client; the wire protocol does not depend on them.
+
 - Server ping interval: 15s. Server idle re-list interval: 1s (this bounds
   change latency when the bucket is written by an external process and no
   in-process notification tee is wired).
-- Client stream tick: 1s (stop-flag responsiveness). Client dead-man: 45s
-  without a single received byte — any byte counts as liveness, so a large
-  frame that streams slowly but steadily is never killed. Mid-frame read
-  timeouts never surface events; idle ticks are only reported between
+- Client stream tick: 1s (cancellation responsiveness). Client dead-man:
+  45s without a single received byte — any byte counts as liveness, so a
+  large frame that streams slowly but steadily is never killed. Mid-frame
+  read timeouts never surface events; idle ticks are only reported between
   frames.
+- Client socket writes tick at 2s so an in-flight upload notices
+  cancellation promptly; a write making zero progress for a cumulative
+  `io_timeout` (default 30s) fails as transient. Any progress resets the
+  budget — slow-but-flowing uplinks are never killed.
 - Server write timeout: 60s per blocked write — a peer that accepts zero
   bytes for 60s is stalled or suspended; slow-but-progressing drains never
   trip it. To stay compatible with this, clients MUST drain file-GET bodies
@@ -178,38 +284,129 @@ default):
   (`{name} {size} {created_ms|-}\n`) so the pusher gets an authoritative
   `FileInfo`. Atomicity and idempotency are the receiving backend's: a
   connection cut mid-body leaves nothing behind, and re-pushing the same
-  key is harmless — exactly the retry semantics writers rely on. Requests
-  without `Content-Length` or chunked encoding are `411`. On error paths
-  the server drains a bounded amount of unread body before closing so the
-  rejection is deliverable; the reference client additionally reads the
-  response after a mid-upload write failure, so a 403/400 surfaces as its
-  message rather than a broken pipe.
+  key with the same bytes is harmless — exactly the retry semantics
+  writers rely on. (Re-pushing an existing L0 key with *different* bytes
+  is `409`, see Fencing.) The reference server receives the body in full
+  into a local spool before committing, so a slow uplink never blocks
+  other requests on the same bucket. Requests without `Content-Length` or
+  chunked encoding are `411`. On **every** error path — including `401`,
+  `409`, and even `404` for an unmatched path or `405` for a foreign
+  method — the server drains a bounded amount of unread body before
+  closing so the rejection is deliverable (an RST from unread bytes could
+  destroy the response and make a permanent error look transient); the
+  reference client additionally reads the response after a mid-upload
+  write failure, so a 401/403/409/400 surfaces as its message rather than
+  a broken pipe.
 - `DELETE /ltx/{level}/{min:016x}-{max:016x}.ltx` — `200`; deleting a
   missing file is also `200` (trait contract: not an error).
 - `DELETE /all` — wipes the bucket. `200`.
 
-Every accepted write wakes the server's `/stream` followers, so a writable
-server is simultaneously a **relay**: devices push in, downstream replicas
-stream out with no polling latency, and the receiving process can follow
-its own server over loopback for a live local materialization.
+Every accepted write wakes that bucket's `/stream` followers, so a
+writable server is simultaneously a **relay**: devices push in, downstream
+replicas stream out with no polling latency, and the receiving process can
+follow its own server over loopback for a live local materialization.
 
-Security: protocol v1 has no auth, and a writable server accepts
-`DELETE /all` from anyone who can reach it. Only enable `writable` on
-loopback/private interfaces, or behind a reverse proxy that authenticates
-`PUT`/`DELETE`.
+Security: an unauthenticated writable server accepts `DELETE /all` from
+anyone who can reach it. Only enable `writable` on loopback/private
+interfaces, behind an authenticating reverse proxy, or with an auth token
+configured (see Authentication).
 
 Server-side body timeout: a pushed body that stops flowing for 30s is
 aborted (per-read timeout; slow-but-flowing uplinks are fine). The pusher
 re-pushes on its next `push()` — PUTs are idempotent.
 
+### Fencing
+
+Writable servers gate every write (`PUT`, `DELETE`, `DELETE /all`) per
+bucket, after auth and before the backend is touched. Rejections are `409`
+with a one-line reason; rejected `PUT` bodies get the bounded drain
+treatment. Two independent rules:
+
+**Writer lease** — applies only to requests carrying
+
+```
+x-liters-writer-id: <id>           (visible ASCII, like the auth token)
+x-liters-writer-takeover: 1        (optional)
+```
+
+The bucket remembers the last identified writer and when it last
+**successfully** wrote. An identified write is allowed to proceed iff no
+lease is held, the holder is this id, the lease is older than the TTL
+(`HttpServerOptions::lease_ttl`, default 24h), or the request carries the
+takeover header. Otherwise `409` with body `bucket is owned by writer
+<id>` (only the owner's id is revealed). The lease is taken/refreshed
+**only when the write is accepted and committed**: a rejected (`409`,
+`400`) or failed (`500`) request never creates a lease and never
+refreshes one — a stray misdirected push cannot fence out the legitimate
+writer, and a client stuck retrying rejected pushes cannot keep its own
+lease alive past the TTL. Requests **without** the header skip lease
+logic entirely — plain v1 pushers are unaffected — but still face
+monotonicity.
+
+The lease is **in-memory and resets on server restart**: fencing is a
+dual-writer *detector*, not a distributed lock. The monotonicity rule
+below is what protects bucket integrity across restarts.
+
+**TXID monotonicity** — applies to every `PUT` (headerless or not):
+
+- Level 0 is the replication log. With `cur` = the bucket's max L0 TXID,
+  a `PUT` is accepted iff L0 is empty, or `min == cur + 1` (an append), or
+  the exact `{min,max}` file already exists **and the pushed body is
+  byte-identical to the stored file** (idempotent re-push — writer
+  crash-retry resends the same local file). A same-key push with
+  *different* content is `409`: it is the dual-writer signature (two
+  devices restored from the same backup racing the same position), and
+  accepting it would silently splice a divergent lineage under history
+  already served to followers. Equality is checked size-first (from the
+  listing), then byte-wise against the stored file — cheap on the
+  directory backing, one extra object read on remote backings, and only
+  on the rare re-push path. Any other range is `409` with body
+  `non-monotonic L0 push: <min>-<max> offered, bucket at <cur>`.
+- Levels 1–9 only ever summarize **uploaded** history (compactions,
+  snapshots): a `PUT` is accepted iff `max <=` the bucket-wide max TXID
+  across all levels. (An exact re-push trivially satisfies this.)
+  Otherwise `409` with a body naming the offered range and the bucket
+  max. This imposes an **upload-ordering contract on pushers**: push the
+  L0 backlog first, then compactions/snapshots — a snapshot taken at a
+  local position ahead of the uploaded L0s must not land before the L0s
+  that justify it (the liters `Writer` uploads its L0 backlog before any
+  higher-level push). Same-key L1–9 overwrites are permitted within that
+  bound — recompaction of the same range is normal.
+- `DELETE`s face only the lease rule — deletes are retention/GC, which
+  monotonicity does not constrain.
+
+**Atomicity** — the fence decision and the backend commit are atomic per
+bucket: mutations of one bucket are serialized by the server, and the
+authoritative fence is evaluated against fresh listings inside that
+critical section, *after* the request body has been fully received into a
+local spool (the write lock is never held across a network read). An
+advisory copy of the fence also runs before the body is received, purely
+to reject doomed pushes early; passing it commits nothing. Two concurrent
+`PUT`s for the same TXID therefore yield exactly one `200` — the other
+gets `409` and knows its push was not accepted.
+
+Cost: evaluating the gate takes one listing per fence pass against the
+backing client (L0 for L0 pushes; all levels for higher-level pushes);
+`PUT`s pay it twice (advisory + authoritative). The design target is a
+directory backing where a listing is one readdir.
+
+A fenced-out or non-monotonic writer sees `409` as a non-retryable
+conflict; the correct reaction is to re-check its lineage against the
+bucket (the liters `Writer` rebaselines when the bucket has moved ahead),
+not to retry the same file.
+
 ## Error mapping (client)
 
-| HTTP | `StorageError` |
+| condition | `StorageError` |
 |---|---|
 | 404 on a file GET | `NotFound { level, min, max }` (re-plan signal) |
-| 403 on a write | `Other` with the server's "read-only" message |
+| 401 | `Unauthorized` (message includes the server's body excerpt) |
+| 403 on a write | `ReadOnly` with the server's "read-only" message |
+| 409 | `Conflict` (fencing: lease or monotonicity, see Fencing) |
 | non-200 elsewhere | `Other` (message includes the status and error body) |
-| missing/unknown `x-liters-protocol` | `Other` ("not a liters server" / version mismatch) |
+| resolve/connect failure, timeout, reset, broken pipe, EOF mid-body, dead-man, truncated listing | `Unavailable` (transient — safe to retry) |
+| missing/unknown `x-liters-protocol`, malformed frames or listings | `Other` (protocol error — not transient) |
+| cancelled via `CancelToken` | `Cancelled` (never misreported as `Unavailable`) |
 
 ## Serving
 
@@ -235,13 +432,34 @@ latency. Serving an S3-backed `ReplicaClient` works but is not recommended:
 that backend buffers whole objects in memory and serializes calls on a
 private runtime.
 
+Serving many databases from one listener uses the multi-DB registry
+(see Multiple databases for the routing rules):
+
+```rust
+let srv = HttpServer::bind_multi("0.0.0.0:9736", HttpServerOptions::default())?;
+srv.add_db("app", Arc::new(DirReplicaClient::new(bucket)))?;
+let mut w = Writer::open("app.db",
+                         srv.notifying_client_for("app", Box::new(DirReplicaClient::new(bucket)))?,
+                         WriterOptions::default())?;
+// followers point at http://host:9736/db/app
+```
+
 ## Following
 
 ```rust
 let client = Box::new(HttpReplicaClient::new("http://host:9736")?);
 let mut r = Replica::open("replica.db", client, ReplicaOptions::default());
 r.sync()?;                       // one-shot restore / catch-up works as usual
-r.follow(&stop, &FollowOptions { retry: Some(Duration::from_secs(1)), ..Default::default() })?;
+r.follow(&stop, &FollowOptions { retry: Some(Backoff::default()), ..Default::default() })?;
+```
+
+Auth tokens, fencing identity, and timeouts are per-client options:
+
+```rust
+let client = Box::new(HttpReplicaClient::with_options(
+    "http://host:9736/db/app",
+    HttpClientOptions { auth_token: Some(token), ..HttpClientOptions::default() },
+)?);
 ```
 
 `Replica::follow` runs `sync()` to catch up (full restore on first run,

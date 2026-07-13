@@ -353,8 +353,13 @@ fn device_restore_rebaselines_from_bucket() {
 
     let client = Box::new(DirReplicaClient::new(&bucket));
     let mut w = Writer::open(&db_path, client, WriterOptions::default()).unwrap();
-    // check_behind_remote adopted the bucket position.
-    assert_eq!(w.pos().unwrap().txid, Txid(5));
+    // open() no longer touches the bucket; the lineage check on the first
+    // push detects the bucket ahead of the (wiped) local lineage and adopts
+    // the bucket position.
+    assert_eq!(w.pos().unwrap().txid, Txid(0));
+    let r = w.push().unwrap();
+    assert_eq!(r.txid, Txid(5), "first push must rebaseline to the bucket position");
+    assert_eq!(r.uploaded, 0, "the rebaselining push uploads nothing");
 
     let expect = snapshot_rows(&app);
     let r = w.push().unwrap();

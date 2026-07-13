@@ -13,7 +13,7 @@ pub enum Error {
     Wal(#[from] liters_wal::WalError),
 
     #[error("storage: {0}")]
-    Storage(#[from] liters_storage::StorageError),
+    Storage(#[source] liters_storage::StorageError),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -40,6 +40,37 @@ pub enum Error {
     #[error("transaction not available")]
     TxNotAvailable,
 
+    /// The operation was cancelled via a
+    /// [`CancelToken`](liters_storage::CancelToken).
+    #[error("operation cancelled")]
+    Cancelled,
+
     #[error("{0}")]
     Other(String),
+}
+
+/// Storage-level cancellation surfaces as [`Error::Cancelled`] so callers
+/// match a single variant no matter which layer observed the token.
+impl From<liters_storage::StorageError> for Error {
+    fn from(e: liters_storage::StorageError) -> Error {
+        match e {
+            liters_storage::StorageError::Cancelled => Error::Cancelled,
+            e => Error::Storage(e),
+        }
+    }
+}
+
+impl Error {
+    /// Whether retrying the same operation later can plausibly succeed:
+    /// transient storage failures (per
+    /// [`StorageError::is_transient`](liters_storage::StorageError::is_transient))
+    /// and local I/O hiccups. Divergence, integrity errors, and cancellation
+    /// are never transient.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Error::Storage(e) => e.is_transient(),
+            Error::Io(_) => true,
+            _ => false,
+        }
+    }
 }

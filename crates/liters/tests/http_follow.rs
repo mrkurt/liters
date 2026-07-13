@@ -22,8 +22,8 @@ use std::thread::ScopedJoinHandle;
 use std::time::{Duration, Instant};
 
 use liters::{
-    DirReplicaClient, FollowOptions, LtxStream, MaintenanceOptions, Replica, ReplicaClient,
-    ReplicaOptions, StreamEvent, Writer, WriterOptions,
+    Backoff, CancelToken, DirReplicaClient, FollowOptions, LtxStream, MaintenanceOptions, Replica,
+    ReplicaClient, ReplicaOptions, StreamEvent, Writer, WriterOptions,
 };
 use liters_storage::{HttpReplicaClient, HttpServer, HttpServerOptions};
 use ltx::Txid;
@@ -39,8 +39,13 @@ fn fast_server() -> HttpServerOptions {
     }
 }
 
+/// Fixed-delay backoff (no growth, no jitter) so retrying tests keep a
+/// deterministic cadence.
 fn follow_opts(retry: Option<Duration>) -> FollowOptions {
-    FollowOptions { poll_interval: Duration::from_millis(100), retry }
+    FollowOptions {
+        poll_interval: Duration::from_millis(100),
+        retry: retry.map(|d| Backoff { initial: d, max: d, multiplier: 1.0, jitter: 0.0 }),
+    }
 }
 
 fn create_db(path: &Path) -> Connection {
@@ -148,14 +153,14 @@ fn poll_until<T>(
     false
 }
 
-/// Sets the follow() stop flag on drop, so a panic anywhere in a test's
+/// Cancels the follow() token on drop, so a panic anywhere in a test's
 /// scope body can never leave the follower thread running forever (which
 /// would hang the scope join, and CI).
-struct StopGuard<'a>(&'a AtomicBool);
+struct StopGuard<'a>(&'a CancelToken);
 
 impl Drop for StopGuard<'_> {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.cancel();
     }
 }
 
@@ -292,7 +297,7 @@ fn streaming_follow_live() {
     let replica_path = tmp.path().join("replica.db");
     let mut rep = Replica::open(&replica_path, http_client(&srv), ReplicaOptions::default());
 
-    let stop = AtomicBool::new(false);
+    let stop = CancelToken::new();
     let final_txid = AtomicU64::new(0);
     let writer_done = AtomicBool::new(false);
     let mut sidecar_seen: Vec<String> = Vec::new();
@@ -331,7 +336,7 @@ fn streaming_follow_live() {
             writer_done.load(Ordering::SeqCst) && f != 0 && sidecar_txid(&replica_path) == f
         });
 
-        stop.store(true, Ordering::SeqCst);
+        stop.cancel();
         let follow_res = follower.join().expect("follower thread panicked");
         writer.join().expect("writer thread panicked");
         (converged, follow_res)
@@ -450,14 +455,14 @@ fn gap_bridged_after_l0_prune() {
 
     // The mid-history follower converges via follow(): its first stream open
     // hits the gap, which routes through sync()'s L1 bridge.
-    let stop = AtomicBool::new(false);
+    let stop = CancelToken::new();
     let fo = follow_opts(None);
     let (converged, res) = std::thread::scope(|s| {
         let follower = s.spawn(|| bridge.follow(&stop, &fo));
         let _stop_guard = StopGuard(&stop);
         let converged =
             poll_until(Duration::from_secs(60), &follower, || sidecar_txid(&bridge_path) == 10);
-        stop.store(true, Ordering::SeqCst);
+        stop.cancel();
         (converged, follower.join().expect("follower thread panicked"))
     });
     srv.shutdown();
@@ -498,7 +503,7 @@ fn reseed_detected_and_auto_reset() {
     let replica_path = tmp.path().join("replica.db");
     {
         let mut rep = Replica::open(&replica_path, http_client(&srv), ReplicaOptions::default());
-        let stop = AtomicBool::new(false);
+        let stop = CancelToken::new();
         let fo = follow_opts(None);
         let (converged, res) = std::thread::scope(|s| {
             let follower = s.spawn(|| rep.follow(&stop, &fo));
@@ -506,7 +511,7 @@ fn reseed_detected_and_auto_reset() {
             let converged = poll_until(Duration::from_secs(60), &follower, || {
                 sidecar_txid(&replica_path) == 20
             });
-            stop.store(true, Ordering::SeqCst);
+            stop.cancel();
             (converged, follower.join().expect("phase-1 follower panicked"))
         });
         res.expect("phase-1 follow errored");
@@ -549,14 +554,14 @@ fn reseed_detected_and_auto_reset() {
         http_client(&srv),
         ReplicaOptions { auto_reset: true, ..Default::default() },
     );
-    let stop = AtomicBool::new(false);
+    let stop = CancelToken::new();
     let fo = follow_opts(Some(Duration::from_millis(100)));
     let (converged, res) = std::thread::scope(|s| {
         let follower = s.spawn(|| rep.follow(&stop, &fo));
         let _stop_guard = StopGuard(&stop);
         let converged =
             poll_until(Duration::from_secs(60), &follower, || sidecar_txid(&replica_path) == 3);
-        stop.store(true, Ordering::SeqCst);
+        stop.cancel();
         (converged, follower.join().expect("phase-2 follower panicked"))
     });
     srv.shutdown();
@@ -597,7 +602,7 @@ fn server_restart_mid_follow() {
         ReplicaOptions::default(),
     );
 
-    let stop = AtomicBool::new(false);
+    let stop = CancelToken::new();
     let fo = follow_opts(Some(Duration::from_millis(200)));
     let outcome = std::thread::scope(|s| {
         let follower = s.spawn(|| rep.follow(&stop, &fo));
@@ -633,14 +638,14 @@ fn server_restart_mid_follow() {
         }
         let Some(mut srv2) = srv2 else {
             eprintln!("SKIP: port {port} stolen; cannot rebind for the restart test");
-            stop.store(true, Ordering::SeqCst);
+            stop.cancel();
             let _ = follower.join();
             return None;
         };
 
         let converged =
             poll_until(Duration::from_secs(60), &follower, || sidecar_txid(&replica_path) == 20);
-        stop.store(true, Ordering::SeqCst);
+        stop.cancel();
         let res = follower.join().expect("follower thread panicked");
         srv2.shutdown();
         Some((caught_up, converged, res))
@@ -737,7 +742,7 @@ fn external_writer_poll_path() {
     let replica_path = tmp.path().join("replica.db");
     let mut rep = Replica::open(&replica_path, http_client(&srv), ReplicaOptions::default());
 
-    let stop = AtomicBool::new(false);
+    let stop = CancelToken::new();
     let fo = follow_opts(None);
     let (converged, res) = std::thread::scope(|s| {
         let follower = s.spawn(|| rep.follow(&stop, &fo));
@@ -751,7 +756,7 @@ fn external_writer_poll_path() {
 
         let converged =
             poll_until(Duration::from_secs(30), &follower, || sidecar_txid(&replica_path) == 10);
-        stop.store(true, Ordering::SeqCst);
+        stop.cancel();
         (converged, follower.join().expect("follower thread panicked"))
     });
     srv.shutdown();
@@ -793,7 +798,7 @@ fn big_single_commit_frame() {
     let replica_path = tmp.path().join("replica.db");
     let mut rep = Replica::open(&replica_path, http_client(&srv), ReplicaOptions::default());
 
-    let stop = AtomicBool::new(false);
+    let stop = CancelToken::new();
     let fo = follow_opts(None);
     let (streamed, converged, res) = std::thread::scope(|s| {
         let follower = s.spawn(|| rep.follow(&stop, &fo));
@@ -808,7 +813,7 @@ fn big_single_commit_frame() {
 
         let converged =
             poll_until(Duration::from_secs(60), &follower, || sidecar_txid(&replica_path) == 2);
-        stop.store(true, Ordering::SeqCst);
+        stop.cancel();
         (streamed, converged, follower.join().expect("follower thread panicked"))
     });
     srv.shutdown();

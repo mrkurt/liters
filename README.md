@@ -37,9 +37,9 @@ r.sync()?;                                  // restore on first call, then incre
 |---|---|
 | `ltx` | LTX v0.5.1 codec: encoder, decoder, page index, k-way compactor, CRC-64/GO-ISO checksums |
 | `liters-wal` | SQLite WAL reader: salt/checksum-verified frames, committed-transaction page maps |
-| `liters-storage` | `ReplicaClient` trait; `dir` backend (litestream `file` layout), `s3` backend (litestream S3 layout, feature `s3`), and liters-native HTTP serving + source (feature `http`) |
-| `liters` | `Writer` (push pipeline, checkpointing, device-side compaction/retention) and `Replica` (restore + incremental follow) |
-| `liters-ffi` | UniFFI bindings for Swift/Kotlin (`scripts/build-ios.sh`, `scripts/build-android.sh`) |
+| `liters-storage` | `ReplicaClient` trait; `dir` backend (litestream `file` layout), `s3` backend (litestream S3 layout, feature `s3`), and liters-native HTTP serving + source with auth, multi-DB routing, and write fencing (feature `http`) |
+| `liters` | `Writer` (push pipeline, checkpointing, device-side compaction/retention), `Replica` (restore + incremental follow), and `Manager` (background replication for N databases with sleep/resume) |
+| `liters-ffi` | UniFFI bindings for Swift/Kotlin: `LitersWriter`, `LitersReplica`, `LitersManager` + event listener (`scripts/build-ios.sh`, `scripts/build-android.sh`) |
 
 ## HTTP replication (liters-native)
 
@@ -64,14 +64,14 @@ let mut w = Writer::open("app.db", srv.notifying_client(Box::new(DirReplicaClien
 // Following side: restore over HTTP, then apply changes as they arrive.
 let mut r = Replica::open("replica.db", Box::new(HttpReplicaClient::new("http://host:9736")?),
                           ReplicaOptions::default());
-r.follow(&stop_flag, &FollowOptions::default())?;   // blocks; flip stop_flag to end
+let cancel = CancelToken::new();
+r.follow(&cancel, &FollowOptions::default())?;   // blocks; cancel() ends it cleanly
 ```
 
 `Replica::sync()` polling works over HTTP too (the server is a full
 read-side `ReplicaClient`), and the server can serve a bucket some other
 process writes — including stock `litestream replicate` — with poll-bounded
-latency. No TLS/auth in v1: bind private interfaces or front with a reverse
-proxy.
+latency. TLS is not built in: front with a reverse proxy (auth below).
 
 Roles also reverse (**push replication**): a server started with
 `writable: true` *accepts* replication, and a writer whose destination is an
@@ -94,6 +94,113 @@ server is also a relay: devices push in, downstream replicas stream out,
 and the receiver can follow its own server over loopback for a live local
 copy. The pushed bucket stays litestream-exact — stock `litestream restore`
 works against it.
+
+### Multi-database serving, auth, fencing
+
+One server can carry many buckets, each addressed as `/db/{name}`; clients
+need no new API — the database is just part of the URL:
+
+```rust
+let srv = HttpServer::bind_multi("0.0.0.0:9736", HttpServerOptions {
+    writable: true,
+    auth_token: Some("secret".into()),
+    ..Default::default()
+})?;
+srv.add_db("app", Arc::new(DirReplicaClient::new("/buckets/app")))?;
+srv.add_db("catalog", Arc::new(DirReplicaClient::new("/buckets/catalog")))?;
+
+// A client for one database of the server:
+let client = HttpReplicaClient::with_options("http://host:9736/db/app",
+    HttpClientOptions { auth_token: Some("secret".into()), ..Default::default() })?;
+```
+
+`add_db`/`remove_db` work while serving, each bucket wakes its own
+`/stream` followers (`notifying_client_for`), and `bind` keeps serving its
+root bucket alongside added ones. With `auth_token` set, every route except
+the `GET /` health check requires `authorization: Bearer <token>`.
+
+Set `HttpServerOptions::base_path` to mount every endpoint under a URL path
+prefix so liters can share an origin with unrelated apps behind a
+path-routing reverse proxy — `http://host/db/...` reaches liters while
+`http://host/users/...` reaches something else. Requests outside the prefix
+are `404`; clients just point at the deeper URL (`http://host:9736/db`), and
+the base path they already parse from the URL lines up with the server's
+mount. (Alternatively, strip the prefix at the proxy and leave `base_path`
+unset — do one or the other, not both.)
+
+```rust
+let srv = HttpServer::bind("0.0.0.0:9736", Arc::new(DirReplicaClient::new("/bucket")),
+                           HttpServerOptions { base_path: Some("/db".into()), ..Default::default() })?;
+let client = HttpReplicaClient::new("http://host:9736/db")?;
+```
+
+Writable servers also *fence* pushers: a writer that sends an
+`x-liters-writer-id` header (`HttpClientOptions::writer_id`; the `Manager`
+fills it automatically with a per-database persisted id) holds a lease on
+its bucket, and pushes from other writer ids are rejected with 409 until
+the lease ages out (`HttpServerOptions::lease_ttl`, default 24h) or a
+takeover is forced. Leases are in-memory — a dual-writer detector, not a
+distributed lock; L0 TXID monotonicity checks protect bucket integrity
+across server restarts. Details in
+[docs/http-protocol.md](docs/http-protocol.md).
+
+## Manager: many databases, sleep/resume
+
+For apps replicating several databases, `liters::Manager` runs one worker
+thread per registered database — pushing on an interval (or only on
+`push_now()`) or following live — with transient failures retried on a
+jittered exponential `Backoff` and fatal errors parked in a `Failed` state
+you can observe and nudge:
+
+```rust
+use std::time::Duration;
+use liters::{Manager, ManagerOptions, PushConfig, FollowConfig, StorageConfig};
+
+let mgr = Manager::new(ManagerOptions::default());
+mgr.register_push("app", "app.db", PushConfig {
+    storage: StorageConfig::Http {
+        url: "http://sync.example:9736/db/app".into(),
+        options: liters::HttpClientOptions {
+            auth_token: Some("secret".into()),
+            ..Default::default()
+        },
+    },
+    writer_options: Default::default(),
+    push_interval: Some(Duration::from_secs(30)),
+    maintenance: Some((Default::default(), Duration::from_secs(3600))),
+    backoff: None,
+})?;
+mgr.register_follow("catalog", "catalog.db", FollowConfig {
+    storage: StorageConfig::Dir { path: "/buckets/catalog".into() },
+    replica_options: Default::default(),
+    follow_options: Default::default(),
+})?;
+
+mgr.set_observer(Some(observer));  // state changes, push completions, errors
+mgr.statuses();                    // per-DB state, position, last error
+
+// Mobile power management: sleeping cancels in-flight transfers and drops
+// the Writer — releasing the WAL read lock and every fd — then parks with
+// zero storage traffic; resume schedules an immediate catch-up round.
+mgr.sleep_all();                   // app went to background
+mgr.resume_all();                  // app returned to foreground
+```
+
+Writers open offline: pushes convert the WAL into local L0 files even with
+the bucket unreachable, and the first successful push uploads the backlog.
+Every long operation also has a `_with` variant taking a `CancelToken`
+(`push_with`, `sync_with`, `maintain_with`, `follow`); flipping the token
+makes the call return `Error::Cancelled` promptly — mid-transfer on the
+HTTP backend — and retrying after a cancel is indistinguishable from
+resuming after a crash. Tokens are one-shot: a cancelled token stays
+cancelled, and a new session gets a fresh one. This is the mechanism behind
+`sleep()`/`resume()` and bounded shutdown.
+
+The same surface ships over FFI: `liters-ffi` exports `LitersWriter` /
+`LitersReplica` (with `cancel()` and `close()`) and `LitersManager`
+(register/sleep/resume/status plus a `ManagerListener` callback interface —
+callbacks arrive on worker threads and must not block). Live follow over
+FFI goes through `LitersManager.register_follow`.
 
 ## Compatibility
 

@@ -12,14 +12,13 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use liters_storage::{ReplicaClient, StreamEvent, SNAPSHOT_LEVEL};
+use liters_storage::{CancelToken, ReplicaClient, StreamEvent, SNAPSHOT_LEVEL};
 use ltx::{is_contiguous, Compactor, Decoder, FileInfo, Txid, HEADER_FLAG_NO_CHECKSUM, HEADER_SIZE};
 use rand::RngCore;
 
-use crate::{Error, Result, StorageError};
+use crate::{Backoff, Error, Result, StorageError};
 
 /// Post-restore integrity checking. (replica.go IntegrityCheck modes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,10 +64,13 @@ pub struct FollowOptions {
     /// made no progress (prevents hot resync loops against a pruned or
     /// stalled bucket).
     pub poll_interval: Duration,
-    /// `Some(d)`: transient storage/network errors back off `d` and retry
-    /// instead of returning — for followers that must survive server
-    /// restarts and flaky links. `None`: fail fast on the first error.
-    pub retry: Option<Duration>,
+    /// `Some(backoff)`: transient storage/network errors (per
+    /// [`Error::is_transient`]) sleep `backoff.delay(n)` — where `n` counts
+    /// consecutive failures and resets to zero whenever a round makes
+    /// progress — and retry instead of returning. For followers that must
+    /// survive server restarts and flaky links. `None`: fail fast on the
+    /// first error. Non-transient errors always return immediately.
+    pub retry: Option<Backoff>,
 }
 
 impl Default for FollowOptions {
@@ -129,9 +131,24 @@ impl Replica {
 
     /// Brings the local replica up to date: a full restore when the local
     /// file is missing, otherwise incremental application of new LTX files.
+    ///
+    /// Equal to [`Replica::sync_with`] with a token that never cancels.
     pub fn sync(&mut self) -> Result<SyncResult> {
+        self.sync_with(&CancelToken::new())
+    }
+
+    /// [`Replica::sync`], cancellable: the token is installed on the storage
+    /// client and checked between fetched files — never mid-apply. A started
+    /// page application always runs to completion: a torn apply is healed by
+    /// re-apply anyway, but deliberately widening that window buys nothing.
+    /// A cancelled sync returns [`Error::Cancelled`]; the local replica is
+    /// exactly as consistent as after a kill (tmp spools removed, position
+    /// sidecar only ever advanced after a completed apply).
+    pub fn sync_with(&mut self, cancel: &CancelToken) -> Result<SyncResult> {
+        self.client.set_cancel(cancel.clone());
+
         if !self.db_path.exists() {
-            let to = self.full_restore()?;
+            let to = self.full_restore(cancel)?;
             return Ok(SyncResult { restored: true, from_txid: Txid(0), to_txid: to });
         }
 
@@ -139,7 +156,7 @@ impl Replica {
         if from.is_zero() {
             // Local file without a sidecar: unresumable. (replica.go:566-568)
             if self.opts.auto_reset {
-                let to = self.full_restore()?;
+                let to = self.full_restore(cancel)?;
                 return Ok(SyncResult { restored: true, from_txid: Txid(0), to_txid: to });
             }
             return Err(Error::Other(format!(
@@ -148,21 +165,21 @@ impl Replica {
             )));
         }
 
-        match self.incremental_sync(from) {
+        match self.incremental_sync(from, cancel) {
             Ok(to) => Ok(SyncResult { restored: false, from_txid: from, to_txid: to }),
             // The healthy replica is never deleted up front: full_restore
             // replaces it atomically only once a complete new image exists,
             // so a failed restore leaves the old replica readable.
             Err(Error::Diverged { .. }) if self.opts.auto_reset => {
-                let to = self.full_restore()?;
+                let to = self.full_restore(cancel)?;
                 Ok(SyncResult { restored: true, from_txid: from, to_txid: to })
             }
             Err(e) => Err(e),
         }
     }
 
-    /// Follows the bucket continuously until `stop` is set or a fatal error
-    /// occurs. Uses the backend's live stream
+    /// Follows the bucket continuously until `cancel` is cancelled or a
+    /// fatal error occurs. Uses the backend's live stream
     /// ([`ReplicaClient::open_ltx_stream`], e.g. a liters HTTP server's
     /// `/stream`) when available — new transactions apply as they arrive
     /// over a single connection — and falls back to polling [`Replica::sync`]
@@ -174,28 +191,39 @@ impl Replica {
     /// recovery. The position sidecar advances after every applied
     /// transaction, so a killed follower resumes exactly where it stopped.
     ///
-    /// Blocking: run it on a dedicated thread and flip `stop` to end it.
-    /// Normally observed within ~a second (or after the in-flight file
-    /// finishes applying); the worst case is the stream dead-man bound
-    /// (~45s) if a frame stalls mid-transfer on a dead link.
-    pub fn follow(&mut self, stop: &AtomicBool, opts: &FollowOptions) -> Result<()> {
-        while !stop.load(Ordering::Relaxed) {
+    /// Blocking: run it on a dedicated thread and cancel the token to end
+    /// it. Cancellation is a clean stop — follow returns `Ok(())`, never
+    /// [`Error::Cancelled`] — normally observed within ~a second (or after
+    /// the in-flight file finishes applying); the worst case is the stream
+    /// dead-man bound (~45s) if a frame stalls mid-transfer on a dead link
+    /// and the backend is not token-aware.
+    pub fn follow(&mut self, cancel: &CancelToken, opts: &FollowOptions) -> Result<()> {
+        self.client.set_cancel(cancel.clone());
+
+        // Consecutive transient-failure count driving the `retry` backoff;
+        // any progress resets it. Empty-bucket waits use poll_interval and
+        // never touch it (an unseeded bucket is not a failure).
+        let mut attempt: u32 = 0;
+        while !cancel.is_cancelled() {
             let before = self.position()?;
-            match self.sync() {
-                Ok(_) => {}
+            match self.sync_with(cancel) {
+                Ok(_) => attempt = 0,
+                // Cancellation is a clean stop, not an error.
+                Err(Error::Cancelled) => return Ok(()),
                 // Empty bucket: the writer has not seeded it yet. Wait,
                 // matching finish_incremental's empty-is-not-divergence
                 // stance.
                 Err(Error::TxNotAvailable) => {
-                    if sleep_checking(stop, opts.poll_interval) {
+                    if sleep_checking(cancel, opts.poll_interval) {
                         return Ok(());
                     }
                     continue;
                 }
-                Err(e) if is_transient(&e) && opts.retry.is_some() => {
-                    if sleep_checking(stop, opts.retry.unwrap()) {
+                Err(e) if e.is_transient() && opts.retry.is_some() => {
+                    if sleep_checking(cancel, opts.retry.as_ref().unwrap().delay(attempt)) {
                         return Ok(());
                     }
+                    attempt = attempt.saturating_add(1);
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -205,11 +233,12 @@ impl Replica {
 
             let stream = match self.client.open_ltx_stream(Txid(position.0 + 1)) {
                 Ok(stream) => stream,
-                Err(e) if opts.retry.is_some() => {
-                    let _ = e;
-                    if sleep_checking(stop, opts.retry.unwrap()) {
+                Err(StorageError::Cancelled) => return Ok(()),
+                Err(e) if e.is_transient() && opts.retry.is_some() => {
+                    if sleep_checking(cancel, opts.retry.as_ref().unwrap().delay(attempt)) {
                         return Ok(());
                     }
+                    attempt = attempt.saturating_add(1);
                     continue;
                 }
                 Err(e) => return Err(e.into()),
@@ -217,7 +246,7 @@ impl Replica {
 
             let Some(mut stream) = stream else {
                 // No streaming support: plain sync() polling.
-                if sleep_checking(stop, opts.poll_interval) {
+                if sleep_checking(cancel, opts.poll_interval) {
                     return Ok(());
                 }
                 continue;
@@ -228,10 +257,11 @@ impl Replica {
             // change the page size.
             let (db, page_size) = match open_db_for_apply(&self.db_path) {
                 Ok(pair) => pair,
-                Err(e) if is_transient(&e) && opts.retry.is_some() => {
-                    if sleep_checking(stop, opts.retry.unwrap()) {
+                Err(e) if e.is_transient() && opts.retry.is_some() => {
+                    if sleep_checking(cancel, opts.retry.as_ref().unwrap().delay(attempt)) {
                         return Ok(());
                     }
+                    attempt = attempt.saturating_add(1);
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -244,7 +274,7 @@ impl Replica {
             // same transient/retry classification as sync() errors, so
             // local I/O hiccups honor `retry` too.
             let stream_err: Option<Error> = loop {
-                if stop.load(Ordering::Relaxed) {
+                if cancel.is_cancelled() {
                     let _ = fs::remove_file(&spool_path);
                     return Ok(());
                 }
@@ -303,19 +333,27 @@ impl Replica {
             };
             let _ = fs::remove_file(&spool_path);
 
+            if made_progress {
+                attempt = 0;
+            }
             if let Some(e) = stream_err {
-                match opts.retry {
-                    Some(backoff) => {
-                        if sleep_checking(stop, backoff) {
+                // A cancelled stream (token-aware backend) is a clean stop.
+                if matches!(e, Error::Cancelled) {
+                    return Ok(());
+                }
+                match &opts.retry {
+                    Some(backoff) if e.is_transient() => {
+                        if sleep_checking(cancel, backoff.delay(attempt)) {
                             return Ok(());
                         }
+                        attempt = attempt.saturating_add(1);
                     }
-                    None => return Err(e),
+                    _ => return Err(e),
                 }
             } else if !made_progress {
                 // The whole round moved nothing: back off before resyncing
                 // so a pruned/stalled bucket can't induce a hot spin.
-                if sleep_checking(stop, opts.poll_interval) {
+                if sleep_checking(cancel, opts.poll_interval) {
                     return Ok(());
                 }
             }
@@ -325,7 +363,7 @@ impl Replica {
 
     /// Full restore: plan → k-way merge → materialize → rename → verify.
     /// (replica.go:622-731)
-    fn full_restore(&mut self) -> Result<Txid> {
+    fn full_restore(&mut self, cancel: &CancelToken) -> Result<Txid> {
         let plan = crate::plan::calc_restore_plan(self.client.as_ref(), Txid(0))?;
 
         // Minimum plausible size check. (replica.go:640-643)
@@ -340,6 +378,7 @@ impl Replica {
 
         let mut rdrs: Vec<Box<dyn Read + Send>> = Vec::with_capacity(plan.len());
         for info in &plan {
+            cancel.check()?;
             rdrs.push(self.client.open_ltx_file(info.level, info.min_txid, info.max_txid, 0, 0)?);
         }
 
@@ -369,6 +408,7 @@ impl Replica {
             f.sync_all()?;
         }
         drop(compact_cleanup);
+        cancel.check()?;
         fs::rename(&tmp_path, &self.db_path)?;
         drop(cleanup);
         fsync_parent(&self.db_path);
@@ -389,7 +429,7 @@ impl Replica {
     /// One round of follow-mode application: L0 from our position, bridging
     /// gaps through levels 1..8, with snapshot fallback and divergence
     /// detection. (replica.go:798-869 + hardening)
-    fn incremental_sync(&mut self, from: Txid) -> Result<Txid> {
+    fn incremental_sync(&mut self, from: Txid, cancel: &CancelToken) -> Result<Txid> {
         let mut f = OpenOptions::new().read(true).write(true).open(&self.db_path)?;
         let page_size = read_page_size(&mut f)?;
 
@@ -404,14 +444,16 @@ impl Replica {
 
         let saw_level0 = !l0.is_empty();
         for info in l0 {
+            cancel.check()?;
             if info.min_txid.0 > current.0 + 1 {
-                current = self.fill_follow_gap(&f, current, info.min_txid, page_size, &mut saw_404)?;
+                current =
+                    self.fill_follow_gap(&f, current, info.min_txid, page_size, &mut saw_404, cancel)?;
                 if info.max_txid <= current {
                     continue;
                 }
                 if info.min_txid.0 > current.0 + 1 {
                     // Still gapped; try again next sync (or snapshot below).
-                    return self.finish_incremental(&f, from, current, page_size, !saw_404);
+                    return self.finish_incremental(&f, from, current, page_size, !saw_404, cancel);
                 }
             }
             if info.max_txid <= current {
@@ -422,17 +464,18 @@ impl Replica {
                 // A listed file may 404 mid-race with compaction/GC:
                 // re-list next sync; never advance past it. (resumable_reader.go:75)
                 Err(Error::Storage(StorageError::NotFound { .. })) => {
-                    return self.finish_incremental(&f, from, current, page_size, false)
+                    return self.finish_incremental(&f, from, current, page_size, false, cancel)
                 }
                 Err(e) => return Err(e),
             }
         }
 
         if !saw_level0 {
-            current = self.fill_follow_gap(&f, current, Txid(current.0 + 1), page_size, &mut saw_404)?;
+            current =
+                self.fill_follow_gap(&f, current, Txid(current.0 + 1), page_size, &mut saw_404, cancel)?;
         }
 
-        self.finish_incremental(&f, from, current, page_size, !saw_404)
+        self.finish_incremental(&f, from, current, page_size, !saw_404, cancel)
     }
 
     /// Post-pass: snapshot fallback and divergence detection, then persist
@@ -446,6 +489,7 @@ impl Replica {
         mut current: Txid,
         page_size: u32,
         allow_snapshot_fallback: bool,
+        cancel: &CancelToken,
     ) -> Result<Txid> {
         if current == from && allow_snapshot_fallback {
             // No progress. Distinguish up-to-date / snapshot-only-newer /
@@ -483,6 +527,7 @@ impl Replica {
             // stalls here; see docs/research/restore-read-path.md §9.)
             if let Some(snap) = newest_snapshot {
                 if snap.max_txid > current {
+                    cancel.check()?;
                     self.apply_ltx_file(f, &snap, page_size)?;
                     current = snap.max_txid;
                 }
@@ -504,6 +549,7 @@ impl Replica {
         gap_min: Txid,
         page_size: u32,
         saw_404: &mut bool,
+        cancel: &CancelToken,
     ) -> Result<Txid> {
         let mut current = after;
         for level in 1..SNAPSHOT_LEVEL {
@@ -514,6 +560,7 @@ impl Replica {
                 if info.max_txid <= current {
                     continue;
                 }
+                cancel.check()?;
                 match self.apply_ltx_file(f, &info, page_size) {
                     Ok(()) => current = info.max_txid,
                     Err(Error::Storage(StorageError::NotFound { .. })) => {
@@ -658,16 +705,6 @@ impl Drop for FcntlLock<'_> {
     }
 }
 
-/// Errors worth retrying under [`FollowOptions::retry`]: storage/transport
-/// failures and local I/O hiccups. Divergence and integrity errors are
-/// never retried blindly. Note that storage-layer errors include
-/// misconfiguration (wrong URL, protocol mismatch) — a follower configured
-/// with `retry` will keep retrying those; validate connectivity up front if
-/// that matters.
-fn is_transient(e: &Error) -> bool {
-    matches!(e, Error::Storage(_) | Error::Io(_))
-}
-
 /// Fresh handle + page size for in-place page application.
 fn open_db_for_apply(db_path: &Path) -> Result<(File, u32)> {
     let mut db = OpenOptions::new().read(true).write(true).open(db_path)?;
@@ -675,12 +712,12 @@ fn open_db_for_apply(db_path: &Path) -> Result<(File, u32)> {
     Ok((db, page_size))
 }
 
-/// Sleeps `total` in short slices so `stop` stays responsive; returns true
-/// if stopped.
-fn sleep_checking(stop: &AtomicBool, total: Duration) -> bool {
+/// Sleeps `total` in short slices so cancellation stays responsive; returns
+/// true if cancelled.
+fn sleep_checking(cancel: &CancelToken, total: Duration) -> bool {
     let deadline = Instant::now() + total;
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return true;
         }
         let left = deadline.saturating_duration_since(Instant::now());
@@ -725,7 +762,7 @@ pub fn write_txid_file(db_path: &Path, txid: Txid) -> Result<()> {
     Ok(())
 }
 
-fn txid_path(db_path: &Path) -> PathBuf {
+pub(crate) fn txid_path(db_path: &Path) -> PathBuf {
     let mut p = db_path.as_os_str().to_owned();
     p.push("-txid");
     PathBuf::from(p)

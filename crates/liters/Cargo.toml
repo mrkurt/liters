@@ -14,6 +14,12 @@ thiserror = { workspace = true }
 rand = { workspace = true }
 libc = "0.2"
 
+[features]
+# Passthrough features: enable the corresponding liters-storage backend and
+# the matching `StorageConfig` variant (manager module).
+http = ["liters-storage/http"]
+s3 = ["liters-storage/s3"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
