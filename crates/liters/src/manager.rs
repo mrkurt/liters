@@ -50,8 +50,22 @@ pub enum StorageConfig {
     /// `options.writer_id` (when `None`) with a per-database persisted id
     /// from the meta dir, so server-side fencing identifies this device
     /// across restarts.
+    ///
+    /// `transport` is an optional shared [`HttpTransport`](liters_storage::HttpTransport).
+    /// When `None` (the default) each session builds a fresh built-in
+    /// socket transport (one `Connection: close` request per call). When
+    /// `Some`, every session of every HTTP-backed database is handed a clone
+    /// of the **same** transport, so an embedder (the mobile FFI layer) can
+    /// pass in one platform-backed transport and have all followers to a host
+    /// coalesce onto a single connection. The `Arc` is cloned per session; the
+    /// transport itself owns connection reuse across the sleep/resume that
+    /// tears down and rebuilds the clients.
     #[cfg(feature = "http")]
-    Http { url: String, options: liters_storage::HttpClientOptions },
+    Http {
+        url: String,
+        options: liters_storage::HttpClientOptions,
+        transport: Option<std::sync::Arc<dyn liters_storage::HttpTransport>>,
+    },
     /// An S3-compatible bucket.
     #[cfg(feature = "s3")]
     S3 { config: liters_storage::S3Config },
@@ -70,9 +84,19 @@ impl StorageConfig {
                 Ok(Box::new(liters_storage::DirReplicaClient::new(path)))
             }
             #[cfg(feature = "http")]
-            StorageConfig::Http { url, options } => Ok(Box::new(
-                liters_storage::HttpReplicaClient::with_options(url, options.clone())?,
-            )),
+            StorageConfig::Http { url, options, transport } => {
+                let client = match transport {
+                    Some(transport) => liters_storage::HttpReplicaClient::with_transport(
+                        url,
+                        options.clone(),
+                        std::sync::Arc::clone(transport),
+                    )?,
+                    None => {
+                        liters_storage::HttpReplicaClient::with_options(url, options.clone())?
+                    }
+                };
+                Ok(Box::new(client))
+            }
             #[cfg(feature = "s3")]
             StorageConfig::S3 { config } => {
                 Ok(Box::new(liters_storage::S3ReplicaClient::new(config.clone())?))

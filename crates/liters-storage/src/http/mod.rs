@@ -1,18 +1,32 @@
 //! liters-native HTTP replication (feature `http`): serve a bucket to other
 //! liters instances ([`HttpServer`]) and read/follow one over HTTP
-//! ([`HttpReplicaClient`]). The wire protocol is liters-proprietary — stock
-//! litestream has no HTTP source scheme — and is specified normatively in
+//! ([`HttpReplicaClient`]). This is the **liters HTTP replication protocol**:
+//! liters' own, *not* litestream's — stock litestream has no HTTP source
+//! scheme, so nothing about this protocol is litestream-compatible (only the
+//! LTX files it moves are). It is specified normatively in
 //! docs/http-protocol.md. Zero-dependency by design: std::net + threads on
-//! the server, a hand-rolled HTTP/1.1 GET client on the read side.
+//! the server, and on the read side a hand-rolled HTTP/1.1 client
+//! ([`StdNetTransport`]) behind a transport seam ([`HttpTransport`]). The seam
+//! lets an embedder inject a different transport without adding dependencies to
+//! this crate: the mobile FFI layer supplies one backed by the platform HTTP
+//! client (Android's OkHttp) so that many followers to one authority coalesce
+//! onto a single HTTP/2 connection, with the platform owning TLS, the trust
+//! store, and keepalive. The protocol — request heads and `liters-stream`
+//! framing — is identical across transports; only the bytes' carrier changes.
 
 mod client;
 pub mod mount;
 mod server;
+mod transport;
 mod wire;
 
 pub use client::{HttpClientOptions, HttpReplicaClient};
 pub use mount::{Body, Mount, MountOptions, Request, Response, StreamBody};
 pub use server::{HttpServer, HttpServerOptions};
+pub use transport::{
+    BodyRead, BodyReader, Cancel, HttpTransport, StdNetTransport, TransportBody, TransportRequest,
+    TransportResponse,
+};
 
 /// Creates an anonymous (created then immediately unlinked) temp file in the
 /// system temp dir, open read+write. The fd keeps the data alive; nothing is

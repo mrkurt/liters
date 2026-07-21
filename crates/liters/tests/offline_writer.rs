@@ -126,7 +126,7 @@ impl ReplicaClient for OfflineClient {
         _level: u8,
         _min: Txid,
         _max: Txid,
-        _rd: &mut dyn std::io::Read,
+        _rd: &mut (dyn std::io::Read + Send),
     ) -> liters_storage::Result<FileInfo> {
         Err(liters_storage::StorageError::Unavailable("bucket unreachable".into()))
     }
@@ -411,7 +411,7 @@ impl ReplicaClient for FlakyClient {
         level: u8,
         min: Txid,
         max: Txid,
-        rd: &mut dyn std::io::Read,
+        rd: &mut (dyn std::io::Read + Send),
     ) -> liters_storage::Result<FileInfo> {
         self.gate()?;
         self.inner.write_ltx_file(level, min, max, rd)

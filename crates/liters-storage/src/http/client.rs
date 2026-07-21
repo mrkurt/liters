@@ -1,13 +1,24 @@
 //! HTTP replica client for a bucket served by a liters [`HttpServer`] (see
-//! docs/http-protocol.md for the wire protocol). Reads always work; writes
+//! docs/http-protocol.md for the liters HTTP replication protocol — liters'
+//! own, not litestream's). Reads always work; writes
 //! (`write_ltx_file`/deletes — i.e. using this client as a `Writer`
 //! destination to *push* replication to a listening liters) require the
 //! server to run with `writable: true`, otherwise they fail with a clear
-//! read-only error. Every request is its own `Connection: close` socket, so
-//! the restore path's N concurrently open plan files are N sockets.
+//! read-only error.
+//!
+//! This type owns only the *protocol* — building request targets, validating
+//! the `x-liters-protocol` header on every response, parsing listing lines and
+//! the `liters-stream` frame grammar. It never touches a socket: every request
+//! is handed to an [`HttpTransport`]. The default
+//! [`StdNetTransport`](super::StdNetTransport) reproduces the v1 wire behavior
+//! (one `Connection: close` socket per request, `http://` only). An embedder
+//! (the mobile FFI layer) can inject a foreign transport — one backed by the
+//! platform HTTP client — via [`HttpReplicaClient::with_transport`], so that
+//! many followers pointed at one authority coalesce onto a single (HTTP/2)
+//! connection with the platform owning TLS and keepalive. The protocol, and
+//! its version, are identical across transports.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -15,19 +26,10 @@ use ltx::{format_filename, parse_filename, FileInfo, Txid};
 
 use crate::{CancelToken, LtxStream, ReplicaClient, Result, StorageError, StreamEvent};
 
-use super::wire::{
-    header, is_timeout, read_head, ChunkedReader, LineBuf, PROTOCOL_HEADER, PROTOCOL_VERSION,
+use super::transport::{
+    BodyReader, Cancel, HttpTransport, StdNetTransport, TransportRequest, TransportResponse,
 };
-
-/// (status, headers, socket positioned at the body).
-type Response = (u16, Vec<(String, String)>, TcpStream);
-
-/// Socket read timeout while a stream is idle; each expiry surfaces as one
-/// [`StreamEvent::Idle`] tick so callers can check their stop flag.
-const STREAM_TICK: Duration = Duration::from_secs(1);
-/// Socket write timeout: each expiry is one cancellation check inside
-/// [`write_full`], which owns the cumulative `io_timeout` stall budget.
-const WRITE_TICK: Duration = Duration::from_secs(2);
+use super::wire::{header, is_timeout, LineBuf, PROTOCOL_HEADER, PROTOCOL_VERSION};
 
 /// Options for [`HttpReplicaClient`]. The defaults reproduce the v1
 /// constants, so [`HttpReplicaClient::new`] behaves exactly as before these
@@ -45,11 +47,11 @@ pub struct HttpClientOptions {
     /// Sent as `x-liters-writer-takeover: 1` on write requests: claim the
     /// bucket even if another writer id holds the lease. Default `false`.
     pub takeover: bool,
-    /// TCP connect timeout, per resolved address. Default 10s.
+    /// TCP connect timeout, per resolved address. Default 10s. Applies to the
+    /// built-in [`StdNetTransport`]; a foreign transport owns its own timeouts.
     pub connect_timeout: Duration,
     /// Socket read timeout, and the cumulative zero-progress budget for
-    /// socket writes (which internally tick every 2s so cancellation stays
-    /// prompt). Default 30s.
+    /// socket writes. Default 30s. Applies to the built-in transport.
     pub io_timeout: Duration,
     /// A `/stream` that has produced no bytes at all (not even a ping) for
     /// this long is declared dead. Must comfortably exceed the server's
@@ -91,16 +93,20 @@ impl HttpClientOptions {
 
 /// Blocking client for a bucket served over HTTP by another liters instance.
 ///
-/// `url` is `http://host:port[/base]` — https is not supported in v1; put a
-/// reverse proxy in front for TLS (and disable response buffering for
-/// `/stream`, see docs/http-protocol.md). A multi-DB server's buckets are
-/// addressed through the base path: `http://host:port/db/{name}`.
+/// With the default transport, `url` is `http://host:port[/base]` — https is
+/// not supported (put a reverse proxy in front for TLS, and disable response
+/// buffering for `/stream`, see docs/http-protocol.md). A foreign transport
+/// injected via [`HttpReplicaClient::with_transport`] may accept `https://`
+/// and owns TLS itself. A multi-DB server's buckets are addressed through the
+/// base path: `http://host:port/db/{name}`.
 pub struct HttpReplicaClient {
-    host: String,
-    port: u16,
-    /// Path prefix, `""` or `/prefix` (no trailing slash).
-    base: String,
+    /// Absolute request base (`scheme://authority[/prefix]`, no trailing
+    /// slash). Every request target is built by appending to it.
+    base_url: String,
     opts: HttpClientOptions,
+    /// The transport that actually moves bytes. Shared (`Arc`) so many
+    /// clients on one authority can share a foreign connection pool.
+    transport: Arc<dyn HttpTransport>,
     /// Current cancellation token ([`ReplicaClient::set_cancel`]). Blocking
     /// loops — uploads, body reads, stream ticks — observe the *current*
     /// token through this shared cell, so a token installed before or
@@ -109,253 +115,103 @@ pub struct HttpReplicaClient {
 }
 
 impl HttpReplicaClient {
+    /// A client using the built-in [`StdNetTransport`] (`http://` only).
     pub fn new(url: impl AsRef<str>) -> Result<HttpReplicaClient> {
         Self::with_options(url, HttpClientOptions::default())
     }
 
+    /// A client using the built-in [`StdNetTransport`] with explicit options.
     pub fn with_options(
         url: impl AsRef<str>,
         options: HttpClientOptions,
     ) -> Result<HttpReplicaClient> {
         options.validate()?;
-        let url = url.as_ref();
-        let rest = if let Some(rest) = url.strip_prefix("http://") {
-            rest
-        } else if url.starts_with("https://") {
-            return Err(StorageError::Other(
-                "https is not supported; terminate TLS with a reverse proxy and use http://"
-                    .into(),
-            ));
-        } else {
-            return Err(StorageError::Other(format!("invalid liters url {url:?}: expected http://host:port[/path]")));
-        };
+        let base_url = normalize_base_url(url.as_ref(), false)?;
+        let transport =
+            Arc::new(StdNetTransport::new(options.connect_timeout, options.io_timeout));
+        Ok(HttpReplicaClient { base_url, opts: options, transport, cancel: Arc::default() })
+    }
 
-        let (authority, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], rest[i..].trim_end_matches('/')),
-            None => (rest, ""),
-        };
-        if authority.contains('@') {
-            return Err(StorageError::Other("userinfo in url is not supported".into()));
-        }
-
-        // host[:port], with [v6]:port bracket support.
-        let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
-            let (host, rest) = v6
-                .split_once(']')
-                .ok_or_else(|| StorageError::Other(format!("bad ipv6 authority {authority:?}")))?;
-            let port = match rest {
-                "" => 80,
-                rest => rest
-                    .strip_prefix(':')
-                    .and_then(|p| p.parse::<u16>().ok())
-                    .ok_or_else(|| {
-                        StorageError::Other(format!("bad port in {authority:?}"))
-                    })?,
-            };
-            (host.to_string(), port)
-        } else {
-            match authority.rsplit_once(':') {
-                Some((h, p)) => (
-                    h.to_string(),
-                    p.parse::<u16>()
-                        .map_err(|_| StorageError::Other(format!("bad port in {authority:?}")))?,
-                ),
-                None => (authority.to_string(), 80),
-            }
-        };
-        if host.is_empty() {
-            return Err(StorageError::Other(format!("missing host in url {url:?}")));
-        }
-
-        Ok(HttpReplicaClient {
-            host,
-            port,
-            base: path.to_string(),
-            opts: options,
-            cancel: Arc::default(),
-        })
+    /// A client whose requests are executed by a caller-supplied
+    /// [`HttpTransport`] rather than the built-in socket code. This is how an
+    /// embedder hands replication to the platform HTTP client (e.g. OkHttp on
+    /// Android): pass **one** shared transport to every follower on a host and
+    /// they coalesce onto a single connection. `https://` urls are accepted —
+    /// the transport owns TLS.
+    pub fn with_transport(
+        url: impl AsRef<str>,
+        options: HttpClientOptions,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Result<HttpReplicaClient> {
+        options.validate()?;
+        let base_url = normalize_base_url(url.as_ref(), true)?;
+        Ok(HttpReplicaClient { base_url, opts: options, transport, cancel: Arc::default() })
     }
 
     fn check_cancel(&self) -> Result<()> {
-        check_token(&self.cancel)
+        self.cancel.lock().unwrap().check()
     }
 
-    fn connect(&self) -> Result<TcpStream> {
-        self.check_cancel()?;
-        let addrs: Vec<_> = (self.host.as_str(), self.port)
-            .to_socket_addrs()
-            .map_err(|e| {
-                StorageError::Unavailable(format!("resolve {}:{}: {e}", self.host, self.port))
-            })?
-            .collect();
-        self.try_addrs(addrs)
-    }
-
-    /// Attempts each resolved address in turn. The token is checked before
-    /// every attempt: a multi-address host (dual-stack, multi-homed) whose
-    /// SYNs are all blackholed must not multiply worst-case cancellation
-    /// latency to `addrs.len() x connect_timeout` — the bound stays a
-    /// single `connect_timeout`.
-    fn try_addrs(&self, addrs: Vec<SocketAddr>) -> Result<TcpStream> {
-        let mut last_err = None;
-        for addr in addrs {
-            self.check_cancel()?;
-            match TcpStream::connect_timeout(&addr, self.opts.connect_timeout) {
-                Ok(s) => {
-                    // A cancel during the connect itself resolves within
-                    // connect_timeout; that granularity is accepted.
-                    self.check_cancel()?;
-                    s.set_nodelay(true)?;
-                    s.set_read_timeout(Some(self.opts.io_timeout))?;
-                    s.set_write_timeout(Some(self.opts.io_timeout.min(WRITE_TICK)))?;
-                    return Ok(s);
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(match last_err {
-            Some(e) => {
-                StorageError::Unavailable(format!("connect {}:{}: {e}", self.host, self.port))
-            }
-            None => {
-                StorageError::Unavailable(format!("no addresses for {}:{}", self.host, self.port))
-            }
-        })
+    fn cancel_handle(&self) -> Cancel {
+        Cancel::new(Arc::clone(&self.cancel))
     }
 
     /// Optional request headers: `authorization` on every request, the
     /// fencing headers (`x-liters-writer-id`/`x-liters-writer-takeover`) on
-    /// write ops only. Values were validated at construction, so straight
-    /// interpolation cannot split headers.
-    fn extra_headers(&self, write_op: bool) -> String {
-        let mut h = String::new();
+    /// write ops only. Values were validated at construction.
+    fn extra_headers(&self, write_op: bool) -> Vec<(String, String)> {
+        let mut h = Vec::new();
         if let Some(token) = &self.opts.auth_token {
-            h.push_str("authorization: Bearer ");
-            h.push_str(token);
-            h.push_str("\r\n");
+            h.push(("authorization".into(), format!("Bearer {token}")));
         }
         if write_op {
             if let Some(id) = &self.opts.writer_id {
-                h.push_str("x-liters-writer-id: ");
-                h.push_str(id);
-                h.push_str("\r\n");
+                h.push(("x-liters-writer-id".into(), id.clone()));
             }
             if self.opts.takeover {
-                h.push_str("x-liters-writer-takeover: 1\r\n");
+                h.push(("x-liters-writer-takeover".into(), "1".into()));
             }
         }
         h
     }
 
-    /// One bodyless request (GET/DELETE): connect, send, parse the response
-    /// head, and validate the liters protocol header — every response must
-    /// carry it, so proxies and foreign servers fail loudly rather than
-    /// being misparsed.
-    fn request(&self, method: &str, target: &str) -> Result<Response> {
-        let stream = self.connect()?;
-        let head = format!(
-            "{method} {target} HTTP/1.1\r\nhost: {}:{}\r\n{}connection: close\r\n\r\n",
-            self.host,
-            self.port,
-            self.extra_headers(method != "GET"),
-        );
-        write_full(&stream, head.as_bytes(), &self.cancel, self.opts.io_timeout)?;
-        self.read_response(target, stream)
-    }
-
-    fn get(&self, target: &str) -> Result<Response> {
-        self.request("GET", target)
-    }
-
-    /// One PUT streaming `body` as a chunked request body (its length is
-    /// unknown — it comes straight off the writer's local file or the
-    /// compactor's pipe). The chunk framing is inlined rather than using
-    /// `ChunkedWriter`: retried writes are only sound around a single raw
-    /// `write` call whose consumed count is tracked (see [`write_full`]),
-    /// and the token must be checked per chunk.
-    fn put(&self, target: &str, body: &mut dyn Read) -> Result<Response> {
-        let stream = self.connect()?;
-        let head = format!(
-            "PUT {target} HTTP/1.1\r\nhost: {}:{}\r\n{}transfer-encoding: chunked\r\nconnection: close\r\n\r\n",
-            self.host,
-            self.port,
-            self.extra_headers(true),
-        );
-        let upload = (|| -> Result<()> {
-            write_full(&stream, head.as_bytes(), &self.cancel, self.opts.io_timeout)?;
-            let mut buf = vec![0u8; 64 << 10];
-            loop {
-                self.check_cancel()?;
-                let n = match body.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    // The body source is local (writer's file, compactor
-                    // spool): its failures stay Io, not Unavailable.
-                    Err(e) => return Err(e.into()),
-                };
-                write_full(&stream, format!("{n:x}\r\n").as_bytes(), &self.cancel, self.opts.io_timeout)?;
-                write_full(&stream, &buf[..n], &self.cancel, self.opts.io_timeout)?;
-                write_full(&stream, b"\r\n", &self.cancel, self.opts.io_timeout)?;
-            }
-            write_full(&stream, b"0\r\n\r\n", &self.cancel, self.opts.io_timeout)?;
-            Ok(())
-        })();
-        if let Err(upload_err) = upload {
-            // Cancellation must return promptly — never wait out a
-            // response read.
-            if matches!(upload_err, StorageError::Cancelled) {
-                return Err(upload_err);
-            }
-            // The server may have rejected early (401/403/409, 400 bad
-            // file) and stopped reading; its response usually still arrived.
-            // Prefer that diagnostic over a raw broken-pipe error.
-            if let Ok(resp) = self.read_response(target, stream) {
-                return Ok(resp);
-            }
-            return Err(upload_err);
+    /// Executes one request through the transport and validates the liters
+    /// protocol header — every response must carry it, so proxies and foreign
+    /// servers fail loudly rather than being misparsed.
+    fn exec(
+        &self,
+        method: &str,
+        url: &str,
+        long_lived: bool,
+        body: Option<&mut (dyn Read + Send)>,
+    ) -> Result<TransportResponse> {
+        self.check_cancel()?;
+        let write_op = method != "GET";
+        let resp = self.transport.execute(TransportRequest {
+            method,
+            url,
+            headers: self.extra_headers(write_op),
+            body,
+            long_lived,
+            cancel: self.cancel_handle(),
+        })?;
+        match header(&resp.headers, PROTOCOL_HEADER) {
+            Some(PROTOCOL_VERSION) => Ok(resp),
+            Some(v) => Err(StorageError::Other(format!(
+                "server speaks liters protocol {v:?}, this client speaks {PROTOCOL_VERSION}"
+            ))),
+            None => Err(StorageError::Other(format!(
+                "{url} is not a liters server (status {}, no {PROTOCOL_HEADER} header)",
+                resp.status
+            ))),
         }
-        self.read_response(target, stream)
-    }
-
-    fn read_response(&self, target: &str, mut stream: TcpStream) -> Result<Response> {
-        let (status_line, headers) = match read_head(&mut stream) {
-            Ok(head) => head,
-            Err(e) => {
-                // A cancel that lands during a blocked head read surfaces
-                // as the read's timeout error; report Cancelled, not
-                // Unavailable.
-                self.check_cancel()?;
-                return Err(transport_err(&format!("{target}: read response"), e));
-            }
-        };
-        let status: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| StorageError::Other(format!("bad status line {status_line:?}")))?;
-
-        match header(&headers, PROTOCOL_HEADER) {
-            Some(PROTOCOL_VERSION) => {}
-            Some(v) => {
-                return Err(StorageError::Other(format!(
-                    "server speaks liters protocol {v:?}, this client speaks {PROTOCOL_VERSION}"
-                )))
-            }
-            None => {
-                return Err(StorageError::Other(format!(
-                    "{}:{}{target} is not a liters server (status {status}, no {PROTOCOL_HEADER} header)",
-                    self.host, self.port
-                )))
-            }
-        }
-        Ok((status, headers, stream))
     }
 
     /// Short error-body excerpt for diagnostics (e.g. the server's
     /// "read-only" message).
-    fn error_detail(headers: &[(String, String)], stream: TcpStream) -> String {
+    fn error_detail(resp: TransportResponse) -> String {
         let mut buf = String::new();
-        let _ = Self::body_reader(headers, stream).take(512).read_to_string(&mut buf);
+        let _ = BodyReader(resp.body).take(512).read_to_string(&mut buf);
         let trimmed = buf.trim();
         if trimmed.is_empty() {
             String::new()
@@ -368,15 +224,9 @@ impl HttpReplicaClient {
     /// (docs/http-protocol.md "Error mapping"), consuming a bounded body
     /// excerpt for the message. 404 is mapped by the callers that have a
     /// NotFound meaning for it; anything unrecognized is `Other`.
-    fn status_error(
-        &self,
-        ctx: &str,
-        status: u16,
-        write_op: bool,
-        headers: &[(String, String)],
-        stream: TcpStream,
-    ) -> StorageError {
-        let msg = format!("{ctx}: http status {status}{}", Self::error_detail(headers, stream));
+    fn status_error(&self, ctx: &str, write_op: bool, resp: TransportResponse) -> StorageError {
+        let status = resp.status;
+        let msg = format!("{ctx}: http status {status}{}", Self::error_detail(resp));
         match status {
             401 => StorageError::Unauthorized(msg),
             // 403 on a *read* is a proxy/misconfig, not "server is
@@ -384,19 +234,6 @@ impl HttpReplicaClient {
             403 if write_op => StorageError::ReadOnly(msg),
             409 => StorageError::Conflict(msg),
             _ => StorageError::Other(msg),
-        }
-    }
-
-    fn body_reader(headers: &[(String, String)], stream: TcpStream) -> Box<dyn Read + Send> {
-        if header(headers, "transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
-        {
-            Box::new(ChunkedReader::new(stream))
-        } else if let Some(n) = header(headers, "content-length").and_then(|v| v.parse().ok()) {
-            let n: u64 = n;
-            Box::new(stream.take(n))
-        } else {
-            // Connection: close delimited.
-            Box::new(stream)
         }
     }
 }
@@ -407,20 +244,20 @@ impl ReplicaClient for HttpReplicaClient {
     }
 
     fn ltx_files(&self, level: u8, seek: Txid, use_metadata: bool) -> Result<Vec<FileInfo>> {
-        let mut target = format!("{}/ltx/{}?seek={}", self.base, level, seek);
+        let mut url = format!("{}/ltx/{}?seek={}", self.base_url, level, seek);
         if use_metadata {
-            target.push_str("&meta=1");
+            url.push_str("&meta=1");
         }
         let ctx = format!("list level {level}");
-        let (status, headers, stream) = self.get(&target)?;
-        if status != 200 {
-            return Err(self.status_error(&ctx, status, false, &headers, stream));
+        let resp = self.exec("GET", &url, false, None)?;
+        if resp.status != 200 {
+            return Err(self.status_error(&ctx, false, resp));
         }
 
-        // Listings always carry content-length (a close-delimited body
-        // cannot distinguish completion from a cut connection, and a
-        // silently truncated listing could masquerade as divergence).
-        let declared: u64 = header(&headers, "content-length")
+        // Listings always carry content-length (a close-delimited body cannot
+        // distinguish completion from a cut connection, and a silently
+        // truncated listing could masquerade as divergence).
+        let declared: u64 = header(&resp.headers, "content-length")
             .and_then(|v| v.parse().ok())
             .ok_or_else(|| {
                 StorageError::Other(format!("list level {level}: missing content-length"))
@@ -430,10 +267,10 @@ impl ReplicaClient for HttpReplicaClient {
                 "list level {level}: implausible listing size {declared}"
             )));
         }
-        // Manual read loop: socket errors are transport (Unavailable), and
-        // the token is checked per chunk.
+        // Manual read loop: socket errors are transport (Unavailable), and the
+        // token is checked per chunk.
         let mut raw = Vec::new();
-        let mut rd = Self::body_reader(&headers, stream);
+        let mut rd = BodyReader(resp.body);
         let mut buf = vec![0u8; 64 << 10];
         loop {
             self.check_cancel()?;
@@ -453,17 +290,15 @@ impl ReplicaClient for HttpReplicaClient {
                 raw.len()
             )));
         }
-        let body = String::from_utf8(raw).map_err(|_| {
-            StorageError::Other(format!("list level {level}: non-utf8 listing"))
-        })?;
+        let body = String::from_utf8(raw)
+            .map_err(|_| StorageError::Other(format!("list level {level}: non-utf8 listing")))?;
 
         let mut infos = Vec::new();
         for line in body.lines() {
             // Unparseable lines are skipped, mirroring the dir backend's
-            // stray-file stance — and keeping old clients tolerant of
-            // future additive columns is NOT allowed by protocol v1 (any
-            // format change bumps the version), so skipping is purely
-            // defensive.
+            // stray-file stance — and keeping old clients tolerant of future
+            // additive columns is NOT allowed by protocol v1 (any format
+            // change bumps the version), so skipping is purely defensive.
             if let Some(info) = parse_listing_line(line, level) {
                 infos.push(info);
             }
@@ -480,61 +315,60 @@ impl ReplicaClient for HttpReplicaClient {
         offset: u64,
         size: u64,
     ) -> Result<Box<dyn Read + Send>> {
-        let mut target =
-            format!("{}/ltx/{}/{}", self.base, level, format_filename(min_txid, max_txid));
+        let mut url =
+            format!("{}/ltx/{}/{}", self.base_url, level, format_filename(min_txid, max_txid));
         if offset > 0 || size > 0 {
-            target.push_str(&format!("?offset={offset}&size={size}"));
+            url.push_str(&format!("?offset={offset}&size={size}"));
         }
-        // The request is sent and the status validated here (eager open):
-        // a 404 surfaces as NotFound at open time, exactly like the dir
-        // backend, preserving the caller's list/open race handling.
-        let (status, headers, stream) = self.get(&target)?;
-        match status {
+        // The request is sent and the status validated here (eager open): a
+        // 404 surfaces as NotFound at open time, exactly like the dir backend,
+        // preserving the caller's list/open race handling.
+        let resp = self.exec("GET", &url, false, None)?;
+        match resp.status {
             // Whole-file reads (the restore/apply paths) are spooled to an
-            // unlinked temp file before returning: the k-way restore merge
-            // can leave a reader untouched for minutes, and a raw socket
-            // parked that long trips the server's stalled-peer write
-            // timeout. Spooling drains every body eagerly, surfaces
-            // transport errors here (as transient Io, not mid-merge decode
-            // errors), and hands the merge a local file. Ranged reads are
-            // small and stay streaming.
+            // unlinked temp file before returning: the k-way restore merge can
+            // leave a reader untouched for minutes, and a raw socket parked
+            // that long trips the server's stalled-peer write timeout.
+            // Spooling drains every body eagerly, surfaces transport errors
+            // here (as transient Io, not mid-merge decode errors), and hands
+            // the merge a local file. Ranged reads are small and stay
+            // streaming.
             200 if offset == 0 && size == 0 => {
-                let spool = spool_body(Self::body_reader(&headers, stream), &self.cancel)?;
+                let spool =
+                    spool_body(Box::new(BodyReader(resp.body)), &self.cancel_handle())?;
                 Ok(Box::new(spool))
             }
-            200 => Ok(Self::body_reader(&headers, stream)),
+            200 => Ok(Box::new(BodyReader(resp.body))),
             404 => Err(StorageError::NotFound { level, min_txid, max_txid }),
             _ => Err(self.status_error(
                 &format!("open L{level} {min_txid}-{max_txid}"),
-                status,
                 false,
-                &headers,
-                stream,
+                resp,
             )),
         }
     }
 
     /// Pushes one LTX file to the server (reversed-role replication: this
-    /// process writes, the listening liters receives). Requires a server
-    /// with `writable: true`; read-only servers answer 403. Atomicity and
+    /// process writes, the listening liters receives). Requires a server with
+    /// `writable: true`; read-only servers answer 403. Atomicity and
     /// idempotency are the receiving backend's (tmp+rename on dir), so a
-    /// connection cut mid-push leaves nothing behind and a re-push of the
-    /// same key is harmless — exactly the retry semantics `Writer` assumes.
+    /// connection cut mid-push leaves nothing behind and a re-push of the same
+    /// key is harmless — exactly the retry semantics `Writer` assumes.
     fn write_ltx_file(
         &self,
         level: u8,
         min_txid: Txid,
         max_txid: Txid,
-        rd: &mut dyn Read,
+        rd: &mut (dyn Read + Send),
     ) -> Result<FileInfo> {
-        let target =
-            format!("{}/ltx/{}/{}", self.base, level, format_filename(min_txid, max_txid));
+        let url =
+            format!("{}/ltx/{}/{}", self.base_url, level, format_filename(min_txid, max_txid));
         let ctx = format!("push L{level} {min_txid}-{max_txid}");
-        let (status, headers, stream) = self.put(&target, rd)?;
-        match status {
+        let resp = self.exec("PUT", &url, false, Some(rd))?;
+        match resp.status {
             200 => {
                 let mut body = String::new();
-                Self::body_reader(&headers, stream)
+                BodyReader(resp.body)
                     .take(4096)
                     .read_to_string(&mut body)
                     .map_err(|e| transport_err(&ctx, e))?;
@@ -542,28 +376,26 @@ impl ReplicaClient for HttpReplicaClient {
                     StorageError::Other(format!("push L{level}: bad put response {body:?}"))
                 })
             }
-            _ => Err(self.status_error(&ctx, status, true, &headers, stream)),
+            _ => Err(self.status_error(&ctx, true, resp)),
         }
     }
 
     fn delete_ltx_files(&self, infos: &[FileInfo]) -> Result<()> {
         for info in infos {
-            let target = format!(
+            let url = format!(
                 "{}/ltx/{}/{}",
-                self.base,
+                self.base_url,
                 info.level,
                 format_filename(info.min_txid, info.max_txid)
             );
-            let (status, headers, stream) = self.request("DELETE", &target)?;
+            let resp = self.exec("DELETE", &url, false, None)?;
             // Missing files are not an error (trait contract); the server
             // answers 200 for those too.
-            if status != 200 {
+            if resp.status != 200 {
                 return Err(self.status_error(
                     &format!("delete L{} {}-{}", info.level, info.min_txid, info.max_txid),
-                    status,
                     true,
-                    &headers,
-                    stream,
+                    resp,
                 ));
             }
         }
@@ -571,28 +403,26 @@ impl ReplicaClient for HttpReplicaClient {
     }
 
     fn delete_all(&self) -> Result<()> {
-        let (status, headers, stream) = self.request("DELETE", &format!("{}/all", self.base))?;
-        if status != 200 {
-            return Err(self.status_error("delete all", status, true, &headers, stream));
+        let resp = self.exec("DELETE", &format!("{}/all", self.base_url), false, None)?;
+        if resp.status != 200 {
+            return Err(self.status_error("delete all", true, resp));
         }
         Ok(())
     }
 
     fn open_ltx_stream(&self, seek: Txid) -> Result<Option<Box<dyn LtxStream>>> {
-        let (status, headers, stream) = self.get(&format!("{}/stream?seek={}", self.base, seek))?;
-        if status != 200 {
-            return Err(self.status_error("open stream", status, false, &headers, stream));
+        let url = format!("{}/stream?seek={}", self.base_url, seek);
+        let resp = self.exec("GET", &url, true, None)?;
+        if resp.status != 200 {
+            return Err(self.status_error("open stream", false, resp));
         }
-        // Short read timeout from here on: each expiry becomes one Idle tick
-        // (at frame boundaries) so followers stay cancel-responsive.
-        stream.set_read_timeout(Some(STREAM_TICK))?;
         Ok(Some(Box::new(HttpLtxStream {
-            body: ChunkedReader::new(stream),
+            body: BodyReader(resp.body),
             line: LineBuf::default(),
             state: HttpStreamState::Preamble,
             last_byte: Instant::now(),
             deadman: self.opts.stream_deadman,
-            cancel: Arc::clone(&self.cancel),
+            cancel: self.cancel_handle(),
         })))
     }
 
@@ -601,76 +431,47 @@ impl ReplicaClient for HttpReplicaClient {
     }
 }
 
-/// Checks the client's *current* token (the cell contents can be replaced
-/// by `set_cancel` mid-operation; the newest token wins).
-fn check_token(cancel: &Mutex<CancelToken>) -> Result<()> {
-    cancel.lock().unwrap().check()
+/// Normalizes a client base url to `scheme://authority[/prefix]` (no trailing
+/// slash). Rejects userinfo and (unless `allow_https`) `https://`. The
+/// authority's host/port validity is checked per-request by the transport.
+fn normalize_base_url(url: &str, allow_https: bool) -> Result<String> {
+    let (scheme, rest) = if let Some(rest) = url.strip_prefix("http://") {
+        ("http", rest)
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        if !allow_https {
+            return Err(StorageError::Other(
+                "https is not supported; terminate TLS with a reverse proxy and use http://, \
+                 or inject a transport that owns TLS"
+                    .into(),
+            ));
+        }
+        ("https", rest)
+    } else {
+        return Err(StorageError::Other(format!(
+            "invalid liters url {url:?}: expected http://host:port[/path]"
+        )));
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].trim_end_matches('/')),
+        None => (rest, ""),
+    };
+    if authority.contains('@') {
+        return Err(StorageError::Other("userinfo in url is not supported".into()));
+    }
+    if authority.is_empty() {
+        return Err(StorageError::Other(format!("missing host in url {url:?}")));
+    }
+    Ok(format!("{scheme}://{authority}{path}"))
 }
 
-/// Socket-side failure → `Unavailable` (the retry-later signal), with
-/// context. Local-file I/O keeps `StorageError::Io`; this is only for
-/// transport errors.
+/// Socket-side failure → `Unavailable` (the retry-later signal), with context.
+/// Local-file I/O keeps `StorageError::Io`; this is only for transport errors.
 fn transport_err(ctx: &str, e: std::io::Error) -> StorageError {
     StorageError::Unavailable(format!("{ctx}: {e}"))
 }
 
-/// Writes all of `buf` to the socket, checking the cancellation token on
-/// every zero-progress send-timeout tick (the socket's write timeout is
-/// `WRITE_TICK`) and giving up with `Unavailable` after `io_timeout` of
-/// cumulative zero progress. Any progress resets the stall budget, so a
-/// slow-but-flowing uplink is never killed.
-///
-/// Soundness of retrying the same slice after a timeout: with SO_SNDTIMEO
-/// on a *blocking* TCP socket, a `write` call that errors with
-/// `WouldBlock`/`TimedOut` has transferred **zero** bytes of that call —
-/// partial progress is returned as `Ok(n)` instead. Linux implements this
-/// in `tcp_sendmsg` (on a send-buffer wait timeout it returns the copied
-/// count if any bytes were queued, and errors only at zero progress);
-/// macOS/XNU's `dofilewrite` converts EWOULDBLOCK-with-partial-uio-progress
-/// into a partial-count success. Verified empirically on macOS (loopback
-/// pair, unread peer, 200ms SO_SNDTIMEO, 4KiB–32MiB writes: bytes received
-/// always equaled the sum of `Ok(n)` returns). This holds ONLY per raw
-/// `write` call — `write_all`'s internal progress is invisible after an
-/// error — which is why this loop tracks its own offset and nothing here
-/// wraps `write_all`.
-fn write_full(
-    stream: &TcpStream,
-    buf: &[u8],
-    cancel: &Mutex<CancelToken>,
-    io_timeout: Duration,
-) -> Result<()> {
-    let mut w: &TcpStream = stream;
-    let mut pos = 0;
-    let mut stalled = Instant::now();
-    while pos < buf.len() {
-        check_token(cancel)?;
-        match w.write(&buf[pos..]) {
-            Ok(0) => return Err(StorageError::Unavailable("socket write returned 0".into())),
-            Ok(n) => {
-                pos += n;
-                stalled = Instant::now();
-            }
-            Err(e) if is_timeout(&e) => {
-                if stalled.elapsed() >= io_timeout {
-                    return Err(StorageError::Unavailable(format!(
-                        "write stalled: no progress for {}s",
-                        io_timeout.as_secs()
-                    )));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                // Prefer Cancelled when a cancel landed mid-write.
-                check_token(cancel)?;
-                return Err(transport_err("write", e));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Parses one `{name} {size} {created_ms|-}` listing line (also the body of
-/// a successful PUT response). `None` for anything malformed.
+/// Parses one `{name} {size} {created_ms|-}` listing line (also the body of a
+/// successful PUT response). `None` for anything malformed.
 fn parse_listing_line(line: &str, level: u8) -> Option<FileInfo> {
     let mut parts = line.split_whitespace();
     let (name, size, created) = (parts.next()?, parts.next()?, parts.next()?);
@@ -689,23 +490,22 @@ fn parse_listing_line(line: &str, level: u8) -> Option<FileInfo> {
 /// Drains `body` into an anonymous (created then immediately unlinked) temp
 /// file and returns it positioned at the start. The fd keeps the data alive;
 /// nothing is left on disk regardless of how the reader is dropped.
-fn spool_body(mut body: Box<dyn Read + Send>, cancel: &Mutex<CancelToken>) -> Result<std::fs::File> {
+fn spool_body(mut body: Box<dyn Read + Send>, cancel: &Cancel) -> Result<std::fs::File> {
     use std::io::{Seek, SeekFrom};
 
     let mut file = super::unlinked_temp_file()?;
     // Manual copy loop: socket-side read failures are transport errors
-    // (Unavailable — the caller re-plans), local spool writes stay Io, and
-    // the token is checked per chunk so a cancelled restore stops pulling
-    // promptly.
+    // (Unavailable — the caller re-plans), local spool writes stay Io, and the
+    // token is checked per chunk so a cancelled restore stops pulling promptly.
     let mut buf = vec![0u8; 64 << 10];
     loop {
-        check_token(cancel)?;
+        cancel.check()?;
         match body.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => file.write_all(&buf[..n])?,
             Err(e) => {
                 // Prefer Cancelled when a cancel landed mid-read.
-                check_token(cancel)?;
+                cancel.check()?;
                 return Err(transport_err("read file body", e));
             }
         }
@@ -724,16 +524,20 @@ enum HttpStreamState {
 }
 
 struct HttpLtxStream {
-    body: ChunkedReader<TcpStream>,
+    /// The transport's response body, adapted so an idle tick reads as a
+    /// `WouldBlock` timeout (see [`BodyReader`]) — so the frame loop below
+    /// handles idle ticks with the same `is_timeout` path the old raw socket
+    /// used.
+    body: BodyReader,
     line: LineBuf,
     state: HttpStreamState,
     last_byte: Instant,
     /// Dead-man bound (`HttpClientOptions::stream_deadman`): zero received
     /// bytes for this long means the stream is dead.
     deadman: Duration,
-    /// The owning client's current-token cell: a cancel installed via
-    /// `set_cancel` interrupts the stream within one STREAM_TICK.
-    cancel: Arc<Mutex<CancelToken>>,
+    /// The owning client's current-token handle: a cancel installed via
+    /// `set_cancel` interrupts the stream within one idle tick.
+    cancel: Cancel,
 }
 
 impl HttpLtxStream {
@@ -772,8 +576,7 @@ fn parse_frame_line(line: &str) -> Result<HttpStreamState> {
             let min_txid = Txid::parse(min).ok_or_else(protocol_err)?;
             let max_txid = Txid::parse(max).ok_or_else(protocol_err)?;
             let size: u64 = size.parse().map_err(|_| protocol_err())?;
-            let info =
-                FileInfo { level, min_txid, max_txid, size, ..Default::default() };
+            let info = FileInfo { level, min_txid, max_txid, size, ..Default::default() };
             Ok(HttpStreamState::Body { info, remaining: size })
         }
         _ => Err(protocol_err()),
@@ -783,10 +586,10 @@ fn parse_frame_line(line: &str) -> Result<HttpStreamState> {
 impl LtxStream for HttpLtxStream {
     fn next(&mut self, sink: &mut dyn Write) -> Result<StreamEvent> {
         loop {
-            // Every pass — idle ticks, frame lines, and body chunks —
-            // observes the current token, so a cancel interrupts within one
-            // STREAM_TICK even while bytes are flowing.
-            check_token(&self.cancel)?;
+            // Every pass — idle ticks, frame lines, and body chunks — observes
+            // the current token, so a cancel interrupts within one idle tick
+            // even while bytes are flowing.
+            self.cancel.check()?;
             match &mut self.state {
                 HttpStreamState::Preamble | HttpStreamState::Frame => {
                     let line = match self.line.read_line(&mut self.body) {
@@ -801,7 +604,7 @@ impl LtxStream for HttpLtxStream {
                     };
                     self.last_byte = Instant::now();
                     let Some(line) = line else {
-                        // Clean chunked EOF.
+                        // Clean EOF.
                         return match self.state {
                             HttpStreamState::Frame => Ok(StreamEvent::Closed),
                             _ => Err(StorageError::Unavailable(
@@ -834,8 +637,9 @@ impl LtxStream for HttpLtxStream {
                         return Ok(StreamEvent::Gap { next });
                     }
                     if let Some(rest) = line.strip_prefix("reset ") {
-                        let bucket_max = Txid::parse(rest.trim())
-                            .ok_or_else(|| StorageError::Other(format!("bad reset frame {line:?}")))?;
+                        let bucket_max = Txid::parse(rest.trim()).ok_or_else(|| {
+                            StorageError::Other(format!("bad reset frame {line:?}"))
+                        })?;
                         return Ok(StreamEvent::Reset { bucket_max });
                     }
                     self.state = parse_frame_line(&line)?;
@@ -850,9 +654,7 @@ impl LtxStream for HttpLtxStream {
                     let want = (*remaining).min(buf.len() as u64) as usize;
                     match self.body.read(&mut buf[..want]) {
                         Ok(0) => {
-                            return Err(StorageError::Unavailable(
-                                "stream ended mid-frame".into(),
-                            ))
+                            return Err(StorageError::Unavailable("stream ended mid-frame".into()))
                         }
                         Ok(n) => {
                             self.last_byte = Instant::now();
@@ -878,25 +680,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn url_parsing() {
+    fn base_url_normalization() {
         let c = HttpReplicaClient::new("http://example.com:8080/some/base/").unwrap();
-        assert_eq!(c.host, "example.com");
-        assert_eq!(c.port, 8080);
-        assert_eq!(c.base, "/some/base");
+        assert_eq!(c.base_url, "http://example.com:8080/some/base");
 
         let c = HttpReplicaClient::new("http://10.0.0.1:9999").unwrap();
-        assert_eq!((c.host.as_str(), c.port, c.base.as_str()), ("10.0.0.1", 9999, ""));
+        assert_eq!(c.base_url, "http://10.0.0.1:9999");
 
         let c = HttpReplicaClient::new("http://[::1]:8080").unwrap();
-        assert_eq!((c.host.as_str(), c.port), ("::1", 8080));
+        assert_eq!(c.base_url, "http://[::1]:8080");
 
-        let c = HttpReplicaClient::new("http://localhost").unwrap();
-        assert_eq!(c.port, 80);
-
+        // https is rejected on the built-in transport, accepted with a foreign
+        // one.
         assert!(HttpReplicaClient::new("https://example.com").is_err());
         assert!(HttpReplicaClient::new("file:///tmp/x").is_err());
         assert!(HttpReplicaClient::new("http://user@host").is_err());
-        assert!(HttpReplicaClient::new("http://host:notaport").is_err());
+
+        let transport = Arc::new(StdNetTransport::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        ));
+        let c = HttpReplicaClient::with_transport(
+            "https://example.com/db/x/",
+            HttpClientOptions::default(),
+            transport,
+        )
+        .unwrap();
+        assert_eq!(c.base_url, "https://example.com/db/x");
     }
 
     #[test]
@@ -915,34 +725,5 @@ mod tests {
         assert!(parse_frame_line("ltx 0 0000000000000005 0000000000000005").is_err());
         assert!(parse_frame_line("ltx 0 0000000000000005 0000000000000005 10 extra").is_err());
         assert!(parse_frame_line("frobnicate").is_err());
-    }
-
-    /// The address sweep must observe the cancellation token *between*
-    /// attempts, not only on entry and after a successful connect —
-    /// otherwise a multi-address blackholed host stretches cancellation
-    /// latency to addrs.len() x connect_timeout.
-    #[test]
-    fn connect_sweep_checks_cancel_between_addresses() {
-        // A just-freed loopback port: connect attempts fail fast (refused).
-        let refused = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            drop(listener);
-            addr
-        };
-        let client = HttpReplicaClient::new("http://127.0.0.1:1").unwrap();
-
-        // Live token: the sweep runs to exhaustion and reports transport
-        // failure.
-        let err = client.try_addrs(vec![refused, refused]).unwrap_err();
-        assert!(matches!(err, StorageError::Unavailable(_)), "live token: {err:?}");
-
-        // Cancelled token: the sweep must return Cancelled instead of
-        // dialing through the address list.
-        let token = CancelToken::new();
-        token.cancel();
-        client.set_cancel(token);
-        let err = client.try_addrs(vec![refused, refused]).unwrap_err();
-        assert!(matches!(err, StorageError::Cancelled), "cancelled token: {err:?}");
     }
 }

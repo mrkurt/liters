@@ -30,6 +30,51 @@ level-0 LTX files to a follower over a single connection.
 - Line-length cap: 8192 bytes for any protocol line (request line, header,
   listing line, frame line) in either direction.
 
+### Client transport is pluggable (HTTP/2, TLS, and mobile)
+
+The protocol above is what rides *inside* an HTTP request/response. The client
+does not mandate how those requests are carried, and the built-in
+`Connection: close`/one-socket-per-request behavior is a property of the
+default transport, not of the protocol. The framing — the request heads, the
+listing body, and the `liters-stream` frames — is byte-identical regardless of
+transport, so the protocol **version is not bumped** by any of this.
+
+- **Default transport** (`StdNetTransport`): the hand-rolled HTTP/1.1 client,
+  `http://` only, one `Connection: close` socket per request. This is what
+  every Rust-native caller (CLIs, server-to-server replication, the test
+  suite) uses.
+- **Host-delegated transport** (mobile): an embedder may hand the client an
+  `HttpTransport` that executes requests on the platform's own HTTP client
+  instead of a socket. The liters-ffi layer exposes this as a Kotlin/Swift
+  `HttpClient` the app implements over a **single shared** platform client
+  (Android: one `OkHttpClient`). Because the app points every liters follow —
+  and, ideally, its unrelated REST calls — at that one client, all requests to
+  a given authority **coalesce onto a single HTTP/2 connection**: N followers
+  become N concurrent h2 streams over one TCP+TLS connection with one keepalive,
+  not N connections. The platform owns ALPN (`h2`, with `http/1.1` fallback),
+  TLS and the system trust store (so `https://` URLs work with no Rust TLS
+  dependency), connection pooling, keepalive PING, and flow control.
+  - The long-lived `/stream` follow is one h2 stream carrying the frame body as
+    DATA frames; `/ltx` fetches and listings are concurrent streams on the same
+    connection. The host reports an idle read-timeout tick to liters (rather
+    than failing) *only* for the follow request, so the client's ping/idle and
+    dead-man logic (§Timing) are unchanged; short requests fail a stalled read
+    normally.
+  - A `PUT` push streams its body: the host pulls request-body bytes from liters
+    as it writes them, so a push is never buffered whole.
+  - The app must not set `Connection: close` and should let the platform keep
+    the connection alive; raising the h2 initial connection/stream windows keeps
+    a large `/ltx` transfer from starving the follow stream. A `421 Misdirected
+    Request` (a server refusing a coalesced authority) is the platform client's
+    to retry on a fresh connection; single-authority path-based mounts
+    (`/db/<name>`) avoid it entirely.
+
+Server-side HTTP/2 is independent of this: the built-in server speaks HTTP/1.1,
+and a host-delegated client reaching it directly negotiates h1 (still pooled).
+End-to-end multiplexing to a directly-connected liters server would require the
+server to speak h2 (e.g. front it with an h2 edge/CDN that terminates h2 and
+speaks h1 to the mount) — a deployment choice, not a protocol change.
+
 ### Versioning
 
 - Every server response carries `x-liters-protocol: 1`. Clients MUST

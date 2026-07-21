@@ -281,7 +281,7 @@ impl ReplicaClient for CountingClient {
         level: u8,
         min_txid: Txid,
         max_txid: Txid,
-        rd: &mut dyn Read,
+        rd: &mut (dyn Read + Send),
     ) -> liters_storage::Result<FileInfo> {
         self.inner.write_ltx_file(level, min_txid, max_txid, rd)
     }

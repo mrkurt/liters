@@ -115,7 +115,7 @@ impl ReplicaClient for DirReplicaClient {
         level: u8,
         min_txid: Txid,
         max_txid: Txid,
-        rd: &mut dyn Read,
+        rd: &mut (dyn Read + Send),
     ) -> Result<FileInfo> {
         // Peek the header to extract the timestamp, preserved as mtime.
         // (file/replica_client.go:163-172)

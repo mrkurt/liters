@@ -149,7 +149,7 @@ impl ReplicaClient for BlockingClient {
         level: u8,
         min: Txid,
         max: Txid,
-        rd: &mut dyn std::io::Read,
+        rd: &mut (dyn std::io::Read + Send),
     ) -> liters_storage::Result<FileInfo> {
         if level != self.block_level {
             return self.inner.write_ltx_file(level, min, max, rd);
@@ -227,7 +227,7 @@ impl ReplicaClient for TokenCheckingClient {
         level: u8,
         min: Txid,
         max: Txid,
-        rd: &mut dyn std::io::Read,
+        rd: &mut (dyn std::io::Read + Send),
     ) -> liters_storage::Result<FileInfo> {
         self.check()?;
         self.inner.write_ltx_file(level, min, max, rd)
@@ -494,7 +494,7 @@ impl ReplicaClient for BurstFailClient {
         level: u8,
         min: Txid,
         max: Txid,
-        rd: &mut dyn std::io::Read,
+        rd: &mut (dyn std::io::Read + Send),
     ) -> liters_storage::Result<FileInfo> {
         self.inner.write_ltx_file(level, min, max, rd)
     }
