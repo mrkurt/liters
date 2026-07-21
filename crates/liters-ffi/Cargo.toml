@@ -13,8 +13,15 @@ name = "liters_ffi"
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
+[features]
+# Off by default: S3 pulls in object_store + the reqwest/hyper/rustls/tokio
+# async stack (several MB of `.so`) that a mobile app following over HTTP never
+# uses. Enable it (`--features s3`) to expose the `Storage::S3` variant.
+default = []
+s3 = ["liters/s3"]
+
 [dependencies]
-liters = { path = "../liters", features = ["http", "s3"] }
+liters = { path = "../liters", default-features = false, features = ["http"] }
 uniffi = { version = "0.32", features = ["cli"] }
 thiserror = { workspace = true }
 

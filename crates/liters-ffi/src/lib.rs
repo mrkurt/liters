@@ -43,7 +43,12 @@ pub enum Storage {
     /// Local directory in litestream's `file` layout (testing, shared
     /// containers).
     Dir { path: String },
-    /// S3-compatible object storage in litestream's S3 layout.
+    /// S3-compatible object storage in litestream's S3 layout. Gated behind
+    /// the `s3` cargo feature (off by default): it pulls in the
+    /// `object_store`/reqwest/rustls/tokio async stack, several MB of `.so`
+    /// that a mobile app following over HTTP never uses. Build
+    /// `liters-ffi --features s3` to expose this variant.
+    #[cfg(feature = "s3")]
     S3 {
         bucket: String,
         prefix: String,
@@ -75,6 +80,7 @@ impl Storage {
     fn into_config(self) -> liters::StorageConfig {
         match self {
             Storage::Dir { path } => liters::StorageConfig::Dir { path: path.into() },
+            #[cfg(feature = "s3")]
             Storage::S3 {
                 bucket,
                 prefix,
