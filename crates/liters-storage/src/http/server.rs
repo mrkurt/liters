@@ -1,8 +1,9 @@
 //! Batteries-included HTTP server: a thin `TcpListener` driver over a single
 //! [`Mount`](super::Mount). It owns the socket lifecycle — accept loop,
 //! thread-per-connection, timeouts, chunked framing, shutdown — and delegates
-//! all protocol decisions to the mount, which is transport-agnostic. Wire
-//! protocol: docs/http-protocol.md.
+//! all protocol decisions to the mount, which is transport-agnostic. Protocol
+//! spec: docs/http-protocol.md (the liters HTTP replication protocol — ours,
+//! not litestream's).
 //!
 //! One server serves one database. To serve several from one listener, or to
 //! serve liters alongside unrelated routes, embed [`Mount`](super::Mount) in

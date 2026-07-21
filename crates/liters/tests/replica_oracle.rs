@@ -545,7 +545,7 @@ impl ReplicaClient for Fail404Once {
         level: u8,
         min_txid: Txid,
         max_txid: Txid,
-        rd: &mut dyn std::io::Read,
+        rd: &mut (dyn std::io::Read + Send),
     ) -> StorageResult<ltx::FileInfo> {
         self.inner.write_ltx_file(level, min_txid, max_txid, rd)
     }

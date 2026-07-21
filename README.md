@@ -1,7 +1,8 @@
 # liters
 
-A Rust library, embeddable in iOS/Android apps, that speaks
-[Litestream](https://litestream.io) v0.5.x's wire and bucket format:
+A Rust library, embeddable in iOS/Android apps, that reads and writes
+[Litestream](https://litestream.io) v0.5.x's LTX file format and bucket
+layout:
 
 - **Produce**: replicate a local, app-owned SQLite database to object storage
   as LTX files. Buckets written by liters restore with stock
@@ -46,8 +47,10 @@ r.sync()?;                                  // restore on first call, then incre
 With the `http` feature, a liters process can serve its bucket over HTTP and
 other liters instances can restore from it and **follow it live** — new
 transactions stream to followers over a single long-lived connection, with
-no object store in between. Stock litestream has no HTTP scheme; the wire
-protocol is liters-proprietary and specified in
+no object store in between. The files on the move are still litestream-format
+LTX, but the protocol carrying them is liters' own: stock litestream v0.5.x
+has no HTTP scheme, so this is the **liters HTTP replication protocol** —
+liters-proprietary, not a litestream protocol — specified normatively in
 [docs/http-protocol.md](docs/http-protocol.md).
 
 ```rust
@@ -201,11 +204,16 @@ FFI goes through `LitersManager.register_follow`.
 
 ## Compatibility
 
-The wire format is implemented from the `superfly/ltx` v0.5.1 **source** (the
-version litestream v0.5.14 pins) and litestream's replica-client sources —
-not from the docs, several of which are stale. Where the two disagree, the
-oracle decides: the test suite builds the real Go `litestream` and `ltx`
-binaries (`make oracle`) and asserts, among others, that
+Liters has two compatibility surfaces, and only one is litestream's. The
+**LTX file format and bucket layout** are litestream v0.5-compatible,
+implemented from the `superfly/ltx` v0.5.1 **source** (the version litestream
+v0.5.14 pins) and litestream's replica-client sources — not from the docs,
+several of which are stale. (The **liters HTTP replication protocol** above is
+the other surface: liters' own, interoperating only with other liters
+instances, moving litestream-format LTX files over a protocol litestream does
+not define.) Where ltx source and docs disagree, the oracle decides: the test
+suite builds the real Go `litestream` and `ltx` binaries (`make oracle`) and
+asserts, among others, that
 
 - every push is restorable by `litestream restore` (file and S3/MinIO),
 - Rust-encoded LTX files pass Go `ltx verify` and apply byte-identically,

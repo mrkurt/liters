@@ -11,9 +11,10 @@
 //! mount's URL prefix already stripped by its router), call [`Mount::handle`],
 //! and write the [`Response`] back — status, headers, and a [`Body`] it either
 //! sends whole, copies from a reader, or pumps from a [`StreamBody`]. All
-//! wire-format knowledge (listing lines, the frame grammar, status codes, the
-//! `x-liters-protocol` header) stays here; the host only supplies parsed
-//! request parts and pumps bytes. Wire protocol: docs/http-protocol.md.
+//! liters-HTTP-protocol knowledge (listing lines, the frame grammar, status
+//! codes, the `x-liters-protocol` header) stays here; the host only supplies
+//! parsed request parts and pumps bytes. Protocol spec: docs/http-protocol.md
+//! (the liters HTTP replication protocol — ours, not litestream's).
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Condvar, Mutex};
@@ -821,7 +822,7 @@ impl ReplicaClient for NotifyingClient {
         level: u8,
         min_txid: Txid,
         max_txid: Txid,
-        rd: &mut dyn Read,
+        rd: &mut (dyn Read + Send),
     ) -> Result<FileInfo> {
         let info = self.inner.write_ltx_file(level, min_txid, max_txid, rd)?;
         self.notify.notify();

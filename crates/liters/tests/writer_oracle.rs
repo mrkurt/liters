@@ -283,7 +283,7 @@ fn upload_failure_preserves_state_and_recovers() {
             level: u8,
             min: Txid,
             max: Txid,
-            rd: &mut dyn std::io::Read,
+            rd: &mut (dyn std::io::Read + Send),
         ) -> liters_storage::Result<ltx::FileInfo> {
             if self.poisoned.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(liters_storage::StorageError::Other("injected failure".into()));

@@ -24,8 +24,9 @@ pub use cancel::CancelToken;
 pub use dir::DirReplicaClient;
 #[cfg(feature = "http")]
 pub use http::{
-    Body, HttpClientOptions, HttpReplicaClient, HttpServer, HttpServerOptions, Mount, MountOptions,
-    Request, Response, StreamBody,
+    Body, BodyRead, BodyReader, Cancel, HttpClientOptions, HttpReplicaClient, HttpServer,
+    HttpServerOptions, HttpTransport, Mount, MountOptions, Request, Response, StdNetTransport,
+    StreamBody, TransportBody, TransportRequest, TransportResponse,
 };
 #[cfg(feature = "s3")]
 pub use s3::{S3Config, S3ReplicaClient};
@@ -117,13 +118,16 @@ pub trait ReplicaClient: Send + Sync {
     /// Writes an LTX file. Implementations peek the 100-byte header to
     /// extract the timestamp and persist it as storage metadata (mtime on
     /// filesystems, `litestream-timestamp` object metadata on S3). Writes are
-    /// atomic and idempotent: re-writing the same key is harmless.
+    /// atomic and idempotent: re-writing the same key is harmless. `rd` is
+    /// `Send` so a transport may pump it from another thread (the HTTP client's
+    /// foreign transport streams the push body from a producer thread); every
+    /// caller already passes a `Send` reader (a file or spool).
     fn write_ltx_file(
         &self,
         level: u8,
         min_txid: Txid,
         max_txid: Txid,
-        rd: &mut dyn Read,
+        rd: &mut (dyn Read + Send),
     ) -> Result<FileInfo>;
 
     /// Deletes LTX files. Missing files are not an error.

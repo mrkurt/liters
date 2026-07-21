@@ -218,7 +218,7 @@ impl ReplicaClient for S3ReplicaClient {
         level: u8,
         min_txid: Txid,
         max_txid: Txid,
-        rd: &mut dyn Read,
+        rd: &mut (dyn Read + Send),
     ) -> Result<FileInfo> {
         // Buffer the file (bounded: L0 deltas are small; snapshots at most
         // the database size) and peek the header for the timestamp.

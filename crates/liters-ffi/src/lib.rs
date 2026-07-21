@@ -102,6 +102,9 @@ impl Storage {
                 // with a per-database persisted id for push registrations;
                 // plain LitersWriter pushes stay headerless (no fencing).
                 options: liters::HttpClientOptions { auth_token, ..Default::default() },
+                // Filled in by the manager wrapper when the app supplied an
+                // `HttpClient` at construction (see `Storage::into_config_with`).
+                transport: None,
             },
         }
     }
@@ -650,6 +653,298 @@ impl liters::ManagerObserver for ListenerAdapter {
     }
 }
 
+// ===========================================================================
+// Host-provided HTTP transport (Android: OkHttp; any platform HTTP client).
+//
+// A mobile app implements `HttpClient`/`HttpResponse` over ONE shared platform
+// client and hands it to `LitersManager` at construction. Every HTTP-backed
+// follower is then executed through it, so N followers to one authority
+// coalesce onto a single (HTTP/2) connection with the platform owning TLS, the
+// system trust store, and keepalive. Nothing about the liters *protocol*
+// changes — the same request heads and `liters-stream` framing ride the
+// platform transport. See docs/http-protocol.md.
+
+/// One HTTP header, carried across the FFI in both directions.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct HttpHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// A request for the host `HttpClient` to execute. `headers` are semantic only
+/// (`authorization`, the fencing headers); the host adds its own transport
+/// headers (`host`, framing, connection). `url` is absolute and may be
+/// `https`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<HttpHeader>,
+    /// `true` only for the long-lived `/stream` follow: the host keeps the
+    /// response open and returns `BodyChunk.Idle` on its read-timeout tick
+    /// (roughly once a second) instead of failing, so liters can run its
+    /// dead-man timer and stay cancel-responsive. For `false` the host uses
+    /// its normal read timeout and *fails* (throws) a stalled read.
+    pub long_lived: bool,
+}
+
+/// One read from a response body.
+#[derive(Debug, uniffi::Enum)]
+pub enum BodyChunk {
+    /// Some decoded body bytes (must be non-empty).
+    Data { bytes: Vec<u8> },
+    /// No bytes right now, connection alive — an idle tick on a `long_lived`
+    /// body. Only valid for `long_lived` requests.
+    Idle,
+    /// The body is complete.
+    Eof,
+}
+
+/// Errors the host transport can report. Thrown from a callback method or
+/// returned as the error arm; anything the host throws that is not one of
+/// these is mapped to `Transport` (see the `From` impl below) rather than
+/// crashing the worker.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum HttpError {
+    /// A network/transport failure (connect, reset, timeout). Retryable —
+    /// maps to liters' `Unavailable`.
+    #[error("http transport: {message}")]
+    Transport { message: String },
+    /// A protocol/format failure (bad framing). Maps to liters' `Other`.
+    #[error("http protocol: {message}")]
+    Protocol { message: String },
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for HttpError {
+    fn from(e: uniffi::UnexpectedUniFFICallbackError) -> HttpError {
+        HttpError::Transport { message: format!("http client raised an unexpected error: {e}") }
+    }
+}
+
+/// The request-body source for a `PUT`, implemented by liters and *called by
+/// the host*: the host pulls bytes as it streams the request body, so a push
+/// is never buffered whole. `read` returns up to `max` bytes; an empty result
+/// is end-of-body. Throwing aborts the upload.
+#[uniffi::export]
+pub trait HttpRequestBody: Send + Sync {
+    fn read(&self, max: u32) -> Result<Vec<u8>, HttpError>;
+}
+
+/// A response, implemented by the host over its platform client's response.
+#[uniffi::export(with_foreign)]
+pub trait HttpResponse: Send + Sync {
+    fn status(&self) -> u16;
+    fn headers(&self) -> Vec<HttpHeader>;
+    /// Pulls the next body bytes, blocking until data, an idle tick
+    /// (`long_lived` only), or end-of-body. Throwing ends the body with a
+    /// transport/protocol error.
+    fn read_body(&self, max: u32) -> Result<BodyChunk, HttpError>;
+    /// Aborts the in-flight call (e.g. OkHttp `Call.cancel()`). Best-effort and
+    /// idempotent; must not throw.
+    fn cancel(&self);
+}
+
+/// The host HTTP client: ONE shared instance for the whole process. Backed by
+/// one platform client (e.g. a single `OkHttpClient`) so requests to one
+/// authority coalesce onto a single connection. `body` is present only for
+/// `PUT` pushes.
+#[uniffi::export(with_foreign)]
+pub trait HttpClient: Send + Sync {
+    fn execute(
+        &self,
+        request: HttpRequest,
+        body: Option<Arc<dyn HttpRequestBody>>,
+    ) -> Result<Arc<dyn HttpResponse>, HttpError>;
+}
+
+fn http_to_storage(e: HttpError) -> liters::StorageError {
+    match e {
+        HttpError::Transport { message } => liters::StorageError::Unavailable(message),
+        HttpError::Protocol { message } => liters::StorageError::Other(message),
+    }
+}
+
+/// Bridges a host [`HttpClient`] onto liters' [`liters::HttpTransport`], so the
+/// manager's HTTP replica clients run every request through the platform
+/// transport.
+struct ForeignTransport(Arc<dyn HttpClient>);
+
+impl liters::HttpTransport for ForeignTransport {
+    fn execute(
+        &self,
+        req: liters::TransportRequest<'_, '_>,
+    ) -> Result<liters::TransportResponse, liters::StorageError> {
+        let liters::TransportRequest { method, url, headers, body, long_lived, cancel } = req;
+        let request = HttpRequest {
+            method: method.to_string(),
+            url: url.to_string(),
+            headers: headers.into_iter().map(|(name, value)| HttpHeader { name, value }).collect(),
+            long_lived,
+        };
+
+        let resp = match body {
+            None => self.0.execute(request, None).map_err(http_to_storage)?,
+            // Streaming PUT body: a scoped producer thread reads `rd` (which is
+            // `Send`) and feeds a bounded channel; the host pulls from it via
+            // the `HttpRequestBody` we pass in. The scope joins the producer
+            // before returning, so `rd`'s borrow never escapes. The producer
+            // polls `stop`/`cancel` so an early server-reject (host stops
+            // reading the body) or a cancel can't wedge it on a full channel.
+            Some(rd) => std::thread::scope(|scope| {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(4);
+                let stop = Arc::new(AtomicBool::new(false));
+                let producer = {
+                    let stop = Arc::clone(&stop);
+                    let cancel = cancel.clone();
+                    scope.spawn(move || {
+                        let mut buf = vec![0u8; 64 << 10];
+                        loop {
+                            if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
+                                return;
+                            }
+                            let msg = match rd.read(&mut buf) {
+                                Ok(0) => return, // EOF: drop tx → host sees end-of-body
+                                Ok(n) => Ok(buf[..n].to_vec()),
+                                Err(e) => Err(e),
+                            };
+                            let was_err = msg.is_err();
+                            let mut pending = Some(msg);
+                            while let Some(m) = pending.take() {
+                                if stop.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                match tx.try_send(m) {
+                                    Ok(()) => {}
+                                    Err(std::sync::mpsc::TrySendError::Full(m)) => {
+                                        pending = Some(m);
+                                        std::thread::sleep(Duration::from_millis(5));
+                                    }
+                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
+                                }
+                            }
+                            if was_err {
+                                return;
+                            }
+                        }
+                    })
+                };
+                let body_obj: Arc<dyn HttpRequestBody> = Arc::new(ChannelRequestBody::new(rx));
+                let out = self.0.execute(request, Some(body_obj)).map_err(http_to_storage);
+                stop.store(true, Ordering::Relaxed);
+                let _ = producer.join();
+                out
+            })?,
+        };
+
+        // A cancel that landed while the host held the request surfaces as
+        // Cancelled, not as whatever the interrupted call returned.
+        cancel.check()?;
+
+        // Getter callbacks return `()`-shaped values, so a host exception in
+        // them is an unrecoverable uniffi panic; contain it.
+        let head = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (resp.status(), resp.headers())
+        }))
+        .map_err(|_| {
+            liters::StorageError::Unavailable("http client panicked reading response head".into())
+        })?;
+        let (status, headers) = head;
+        Ok(liters::TransportResponse {
+            status,
+            headers: headers.into_iter().map(|h| (h.name, h.value)).collect(),
+            body: Box::new(ForeignBody { resp, leftover: Vec::new() }),
+        })
+    }
+}
+
+/// Feeds a host `HttpRequestBody.read` from a bounded channel filled by the
+/// producer thread in [`ForeignTransport::execute`]. A partial read leaves the
+/// remainder in `leftover` for the next call.
+struct ChannelRequestBody {
+    rx: Mutex<std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
+    leftover: Mutex<Vec<u8>>,
+}
+
+impl ChannelRequestBody {
+    fn new(rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>) -> ChannelRequestBody {
+        ChannelRequestBody { rx: Mutex::new(rx), leftover: Mutex::new(Vec::new()) }
+    }
+}
+
+impl HttpRequestBody for ChannelRequestBody {
+    fn read(&self, max: u32) -> Result<Vec<u8>, HttpError> {
+        let max = max as usize;
+        {
+            let mut leftover = plock(&self.leftover);
+            if !leftover.is_empty() {
+                let n = leftover.len().min(max);
+                return Ok(leftover.drain(..n).collect());
+            }
+        }
+        let chunk = plock(&self.rx).recv();
+        match chunk {
+            Ok(Ok(bytes)) => {
+                if bytes.len() <= max {
+                    Ok(bytes)
+                } else {
+                    let out = bytes[..max].to_vec();
+                    *plock(&self.leftover) = bytes[max..].to_vec();
+                    Ok(out)
+                }
+            }
+            Ok(Err(e)) => Err(HttpError::Transport { message: e.to_string() }),
+            // Producer finished (EOF) and dropped the sender.
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+}
+
+/// Adapts a host [`HttpResponse`] into liters' [`liters::TransportBody`]. A
+/// partial read leaves the remainder in `leftover`.
+struct ForeignBody {
+    resp: Arc<dyn HttpResponse>,
+    leftover: Vec<u8>,
+}
+
+impl liters::TransportBody for ForeignBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<liters::BodyRead> {
+        if !self.leftover.is_empty() {
+            let n = self.leftover.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.leftover[..n]);
+            self.leftover.drain(..n);
+            return Ok(liters::BodyRead::Bytes(n));
+        }
+        match self.resp.read_body(buf.len() as u32) {
+            Ok(BodyChunk::Data { bytes }) if bytes.is_empty() => Ok(liters::BodyRead::Idle),
+            Ok(BodyChunk::Data { bytes }) => {
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                if n < bytes.len() {
+                    self.leftover = bytes[n..].to_vec();
+                }
+                Ok(liters::BodyRead::Bytes(n))
+            }
+            Ok(BodyChunk::Idle) => Ok(liters::BodyRead::Idle),
+            Ok(BodyChunk::Eof) => Ok(liters::BodyRead::Eof),
+            // Preserve liters' in-stream taxonomy: InvalidData → protocol error
+            // (`Other`); everything else → transport (`Unavailable`).
+            Err(HttpError::Protocol { message }) => {
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, message))
+            }
+            Err(HttpError::Transport { message }) => Err(std::io::Error::other(message)),
+        }
+    }
+}
+
+impl Drop for ForeignBody {
+    fn drop(&mut self) {
+        // Abort the underlying call so an abandoned follow (a dropped stream on
+        // cancel/resync) frees its connection stream immediately. Best-effort;
+        // `cancel()` returns `()`, so a host exception would be a uniffi panic.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.resp.cancel()));
+    }
+}
+
 /// Runs replication for any number of registered databases on background
 /// threads: each database either pushes to a bucket or follows one, with
 /// automatic retry/backoff, and per-database or global sleep/resume for
@@ -665,6 +960,11 @@ impl liters::ManagerObserver for ListenerAdapter {
 #[derive(uniffi::Object)]
 pub struct LitersManager {
     inner: liters::Manager,
+    /// The host HTTP transport (wrapping the app's `HttpClient`), shared by
+    /// every HTTP-backed registration so followers to one authority coalesce
+    /// onto a single connection. `None` → each HTTP client uses the built-in
+    /// socket transport.
+    http: Option<Arc<dyn liters::HttpTransport>>,
 }
 
 impl Default for LitersManager {
@@ -673,19 +973,48 @@ impl Default for LitersManager {
     }
 }
 
+/// Non-exported helpers.
+impl LitersManager {
+    /// Turns FFI storage into a core config, injecting the shared host HTTP
+    /// transport when one was supplied and the storage is HTTP-backed.
+    fn storage_config(&self, storage: Storage) -> liters::StorageConfig {
+        let mut cfg = storage.into_config();
+        if let (Some(transport), liters::StorageConfig::Http { transport: slot, .. }) =
+            (&self.http, &mut cfg)
+        {
+            *slot = Some(Arc::clone(transport));
+        }
+        cfg
+    }
+}
+
 #[uniffi::export]
 impl LitersManager {
     /// A manager with default options (liters backoff, no default push
     /// interval — databases push on `push_now()` unless registered with
-    /// their own interval).
+    /// their own interval) and no host HTTP transport.
     #[uniffi::constructor]
     pub fn new() -> Self {
-        Self::with_options(ManagerOptions { backoff: None, default_push_interval_ms: None })
+        Self::with_options(ManagerOptions { backoff: None, default_push_interval_ms: None }, None)
     }
 
+    /// A manager with explicit options and, optionally, a host HTTP transport.
+    ///
+    /// Pass `http_client` (one shared instance backed by a single platform
+    /// HTTP client, e.g. one `OkHttpClient`) to have every HTTP follow/push run
+    /// through it: all followers to one authority then coalesce onto a single
+    /// HTTP/2 connection, with the platform owning TLS, the system trust store,
+    /// and keepalive. `null` keeps the built-in socket transport (one
+    /// `Connection: close` request per call, `http://` only).
     #[uniffi::constructor]
-    pub fn with_options(options: ManagerOptions) -> Self {
+    pub fn with_options(
+        options: ManagerOptions,
+        http_client: Option<Arc<dyn HttpClient>>,
+    ) -> Self {
+        let http = http_client
+            .map(|c| Arc::new(ForeignTransport(c)) as Arc<dyn liters::HttpTransport>);
         LitersManager {
+            http,
             inner: liters::Manager::new(liters::ManagerOptions {
                 backoff: options.backoff.map(Into::into).unwrap_or_default(),
                 default_push_interval: options.default_push_interval_ms.map(Duration::from_millis),
@@ -706,7 +1035,7 @@ impl LitersManager {
         options: PushOptions,
     ) -> Result<(), LitersError> {
         let cfg = liters::PushConfig {
-            storage: storage.into_config(),
+            storage: self.storage_config(storage),
             writer_options: liters::WriterOptions::default(),
             push_interval: options.push_interval_ms.map(Duration::from_millis),
             maintenance: options
@@ -733,7 +1062,7 @@ impl LitersManager {
         }
         follow_options.retry = options.retry.map(Into::into);
         let cfg = liters::FollowConfig {
-            storage: storage.into_config(),
+            storage: self.storage_config(storage),
             replica_options: liters::ReplicaOptions {
                 auto_reset: options.auto_reset,
                 ..Default::default()

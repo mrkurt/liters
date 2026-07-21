@@ -189,7 +189,7 @@ impl ReplicaClient for TestClient {
         level: u8,
         min: Txid,
         max: Txid,
-        rd: &mut dyn std::io::Read,
+        rd: &mut (dyn std::io::Read + Send),
     ) -> liters_storage::Result<FileInfo> {
         self.tick();
         if level >= 1 && self.st.fail_fatal_high_level_writes.load(Ordering::SeqCst) {

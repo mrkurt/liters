@@ -39,7 +39,9 @@ pub use liters_storage::{
     SNAPSHOT_LEVEL,
 };
 #[cfg(feature = "http")]
-pub use liters_storage::HttpClientOptions;
+pub use liters_storage::{
+    BodyRead, HttpClientOptions, HttpTransport, TransportBody, TransportRequest, TransportResponse,
+};
 #[cfg(feature = "s3")]
 pub use liters_storage::S3Config;
 pub use ltx::{Pos, Txid};
